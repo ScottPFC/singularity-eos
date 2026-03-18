@@ -211,6 +211,9 @@ class SpinerEOSDependsRhoT : public EosBase<SpinerEOSDependsRhoT> {
   PORTABLE_INLINE_FUNCTION
   Real RhoPmin(const Real temp) const;
 
+  PORTABLE_INLINE_FUNCTION
+  Real RhoSpinodalVapor(const Real temp) const;
+
   static constexpr unsigned long PreferredInput() { return _preferred_input; }
   int matid() const { return matid_; }
   PORTABLE_FORCEINLINE_FUNCTION Real lRhoOffset() const { return lRhoOffset_; }
@@ -323,13 +326,15 @@ class SpinerEOSDependsRhoT : public EosBase<SpinerEOSDependsRhoT> {
   DataBox PCold_, sieCold_, bModCold_;
   DataBox dPdRhoCold_, dPdECold_, dTdRhoCold_, dTdECold_, dEdTCold_;
   DataBox rho_at_pmin_;
+  DataBox rho_at_spinodal_vapor_;
 
   // TODO(JMM): Pointers here? or reference_wrapper? IMO the pointers are more clear
 #define DBLIST                                                                           \
   &P_, &sie_, &bMod_, &dPdRho_, &dPdE_, &dTdRho_, &dTdE_, &dEdRho_, &dEdT_, &mF_,        \
       &PMax_, &sielTMax_, &dEdTMax_, &gm1Max_, &lTColdCrit_, &PCold_, &sieCold_,         \
       &bModCold_, &dPdRhoCold_, &dPdECold_, &dTdRhoCold_, &dTdECold_, &dEdTCold_,        \
-      &rho_at_pmin_
+      &rho_at_pmin_, \
+      &rho_at_spinodal_vapor_
   auto GetDataBoxPointers_() const { return std::vector<const DataBox *>{DBLIST}; }
   auto GetDataBoxPointers_() { return std::vector<DataBox *>{DBLIST}; }
 #undef DBLIST
@@ -612,7 +617,8 @@ inline herr_t SpinerEOSDependsRhoT::loadDataboxes_(const std::string &matid_str,
   setlTColdCrit_();
 
   // fill in minimum pressure as a function of temperature
-  PMin_ = SetRhoPMin(P_, rho_at_pmin_, pmin_vapor_dome_, VAPOR_DPDR_THRESH, lRhoOffset_);
+  PMin_ = SetRhoPMin(P_, rho_at_pmin_, rho_at_spinodal_vapor_, pmin_vapor_dome_,
+                     VAPOR_DPDR_THRESH, lRhoOffset_);
 
   // fill in Gruneisen parameter and bulk modulus on cold curves
   // unfortunately, EOSPAC's output for these parameters appears
@@ -1076,6 +1082,14 @@ Real SpinerEOSDependsRhoT::RhoPmin(const Real temp) const {
   if (lT <= lTMin_) return rho_at_pmin_(0);
   if (lT >= lTMax_) return 0.0;
   return rho_at_pmin_.interpToReal(lT);
+}
+
+PORTABLE_INLINE_FUNCTION
+Real SpinerEOSDependsRhoT::RhoSpinodalVapor(const Real temp) const {
+  const Real lT = lT_(temp);
+  if (lT <= lTMin_) return rho_at_spinodal_vapor_(0);
+  if (lT >= lTMax_) return 0.0;
+  return rho_at_spinodal_vapor_.interpToReal(lT);
 }
 
 template <typename Indexer_t>

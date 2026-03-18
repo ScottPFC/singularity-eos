@@ -56,7 +56,9 @@ PORTABLE_FORCEINLINE_FUNCTION Real from_log(const Real lx, const Real offset) {
   return FastMath::pow10(lx) - offset;
 }
 
-inline Real SetRhoPMin(DataBox &P, DataBox &rho_at_pmin, const bool pmin_vapor_dome,
+inline Real SetRhoPMin(DataBox &P, DataBox &rho_at_pmin,
+                       DataBox &rho_at_spinodal_vapor,
+                       const bool pmin_vapor_dome,
                        const Real VAPOR_DPDR_THRESH, const Real lRhoOffset) {
   Real PMin = std::numeric_limits<Real>::max();
   const auto lTs = P.range(0);
@@ -65,9 +67,12 @@ inline Real SetRhoPMin(DataBox &P, DataBox &rho_at_pmin, const bool pmin_vapor_d
   const Real NR = lRs.nPoints();
   rho_at_pmin.resize(NT);
   rho_at_pmin.setRange(0, lTs);
+  rho_at_spinodal_vapor.resize(NT);
+  rho_at_spinodal_vapor.setRange(0, lTs);
   for (int i = 0; i < NT; ++i) {
     Real PMin_at_T = std::numeric_limits<Real>::max();
     int jmax = 0;
+    int jmin_vapor = -1;
     for (int j = 0; j < NR; ++j) {
       if (P(j, i) < PMin_at_T) {
         PMin_at_T = P(j, i);
@@ -81,15 +86,24 @@ inline Real SetRhoPMin(DataBox &P, DataBox &rho_at_pmin, const bool pmin_vapor_d
         Real dr = from_log(lRs.x(j), lRhoOffset) - from_log(lRs.x(j - 2), lRhoOffset);
         Real dpdr = robust::ratio(dP, dr);
         if (dpdr < VAPOR_DPDR_THRESH) {
-          jmax = j;
+          if (jmin_vapor < 0) jmin_vapor = j;  // first unstable point (vapor side)
+          jmax = j;                             // last unstable point (dense side)
         }
       }
     }
     if ((PMin_at_T > 0) && !pmin_vapor_dome) {
       rho_at_pmin(i) = 0;
+      rho_at_spinodal_vapor(i) = 0;
       PMin_at_T = 0;
     } else {
       rho_at_pmin(i) = from_log(lRs.x(jmax), lRhoOffset);
+      // Vapor-side spinodal: two grid points below first unstable point,
+      // safely on the stable vapor branch.
+      if (jmin_vapor >= 2) {
+        rho_at_spinodal_vapor(i) = from_log(lRs.x(jmin_vapor - 2), lRhoOffset);
+      } else {
+        rho_at_spinodal_vapor(i) = 0;
+      }
     }
     PMin = std::min(PMin_at_T, PMin);
   }

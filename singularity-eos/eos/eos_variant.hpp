@@ -354,6 +354,12 @@ class Variant {
                               eos_);
   }
 
+  PORTABLE_INLINE_FUNCTION
+  Real RhoSpinodalVapor(const Real temp) const {
+    return PortsOfCall::visit(
+        [&temp](const auto &eos) { return eos.RhoSpinodalVapor(temp); }, eos_);
+  }
+
   PORTABLE_FORCEINLINE_FUNCTION
   Real MinimumDensity() const {
     return PortsOfCall::visit([](const auto &eos) { return eos.MinimumDensity(); }, eos_);
