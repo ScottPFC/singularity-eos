@@ -354,8 +354,8 @@ class PTESolverBase {
       if (phys_press > abs_tol_p) has_positive = true;
     }
 #ifdef PTE_DEBUG_TRACE
-    std::printf("    has_negative=%d  has_positive=%d\n",
-                (int)has_negative, (int)has_positive);
+    std::printf("    has_negative=%d  has_positive=%d\n", (int)has_negative,
+                (int)has_positive);
 #endif
     bool any_jumped = false;
 
@@ -383,8 +383,7 @@ class PTESolverBase {
       std::printf("    dom_in_unstable check: dom=%zu  rho[dom]=%.6e  "
                   "RhoPmin(T=%.6e)=%.6e  1.5*RhoPmin=%.6e  "
                   "test=(rho_pmin_dom>0 && rho<=1.5*rho_pmin)=%d\n",
-                  dom, rho[dom], T_physical, rho_pmin_dom,
-                  1.5 * rho_pmin_dom,
+                  dom, rho[dom], T_physical, rho_pmin_dom, 1.5 * rho_pmin_dom,
                   (int)(rho_pmin_dom > 0 && rho[dom] <= 1.5 * rho_pmin_dom));
 #endif
       if (rho_pmin_dom > 0 && rho[dom] <= 1.5 * rho_pmin_dom) {
@@ -457,16 +456,14 @@ class PTESolverBase {
       if (phys_press < -abs_tol_p) {
         need_vapor_jump = true;
 #ifdef PTE_DEBUG_TRACE
-        std::printf("    mat[%zu]: NEGATIVE P (%.6e), need vapor jump\n",
-                    m, phys_press);
+        std::printf("    mat[%zu]: NEGATIVE P (%.6e), need vapor jump\n", m, phys_press);
 #endif
       }
       // Condition (b): pinned at dense-side spinodal (local P minimum).
       // dP/drho ≈ 0 here, so Newton stagnates regardless of P vs P_ref.
       // The equilibrium may be at lower rho in the unstable region where
       // P rises toward the vapor-side peak.
-      else if (rho_pmin > 0 && rho[m] >= rho_pmin
-               && rho[m] <= 1.5 * rho_pmin) {
+      else if (rho_pmin > 0 && rho[m] >= rho_pmin && rho[m] <= 1.5 * rho_pmin) {
         need_vapor_jump = true;
 #ifdef PTE_DEBUG_TRACE
         std::printf("    mat[%zu]: PINNED at spinodal (rho=%.6e, RhoPmin=%.6e, "
@@ -493,8 +490,9 @@ class PTESolverBase {
 
       if (!need_vapor_jump) {
 #ifdef PTE_DEBUG_TRACE
-        std::printf("    mat[%zu]: rho=%.6e  RhoPmin=%.6e  P=%.6e  no vapor jump needed\n",
-                    m, rho[m], rho_pmin, phys_press);
+        std::printf(
+            "    mat[%zu]: rho=%.6e  RhoPmin=%.6e  P=%.6e  no vapor jump needed\n", m,
+            rho[m], rho_pmin, phys_press);
 #endif
         continue;
       }
@@ -502,8 +500,7 @@ class PTESolverBase {
       const Real rho_vapor = eos[m].RhoSpinodalVapor(T_physical);
       if (rho_vapor > 0) {
         // Jump to vapor-side stable region (0.9 safety factor)
-        vfrac[m] = std::min(robust::ratio(rhobar[m], 0.9 * rho_vapor),
-                            vfrac_hi_max);
+        vfrac[m] = std::min(robust::ratio(rhobar[m], 0.9 * rho_vapor), vfrac_hi_max);
         any_jumped = true;
         vfrac[m] = -vfrac[m]; // mark as vapor-jumped for priority normalization
 #ifdef PTE_DEBUG_TRACE
@@ -516,25 +513,24 @@ class PTESolverBase {
         // Fallback: P=0 bisection for materials without pmin_vapor_dome
         // (no precomputed spinodal curve).  Original Path A logic.
         const Real lo_init = vfrac[m];
-        Real hi = std::min(vfrac_hi_max,
-                           robust::ratio(rhobar[m], 1.0e-12));
+        Real hi = std::min(vfrac_hi_max, robust::ratio(rhobar[m], 1.0e-12));
 #ifdef PTE_DEBUG_TRACE
         std::printf("    mat[%zu]: no spinodal curve, fallback P=0 bisection "
-                    "lo=%.6e  hi=%.6e\n", m, lo_init, hi);
+                    "lo=%.6e  hi=%.6e\n",
+                    m, lo_init, hi);
 #endif
         if (hi <= lo_init) continue;
 
         const Real rho_hi = robust::ratio(rhobar[m], hi);
-        const Real P_hi = eos[m].PressureFromDensityTemperature(
-                               rho_hi, T_physical, lambda[m]);
+        const Real P_hi =
+            eos[m].PressureFromDensityTemperature(rho_hi, T_physical, lambda[m]);
         if (P_hi < 0.0) {
           if (std::abs(P_hi) < std::abs(phys_press) * 0.5) {
             vfrac[m] = hi;
             any_jumped = true;
             vfrac[m] = -vfrac[m]; // mark as vapor-jumped for priority normalization
 #ifdef PTE_DEBUG_TRACE
-            std::printf("    mat[%zu]: P_hi<0 but improving, jump to hi=%.6e\n",
-                        m, hi);
+            std::printf("    mat[%zu]: P_hi<0 but improving, jump to hi=%.6e\n", m, hi);
 #endif
           }
           continue;
@@ -545,8 +541,8 @@ class PTESolverBase {
         for (std::size_t iter = 0; iter < max_bisect; ++iter) {
           const Real mid = 0.5 * (lo + hi);
           const Real rho_mid = robust::ratio(rhobar[m], mid);
-          const Real P_mid = eos[m].PressureFromDensityTemperature(
-                                 rho_mid, T_physical, lambda[m]);
+          const Real P_mid =
+              eos[m].PressureFromDensityTemperature(rho_mid, T_physical, lambda[m]);
           if (P_mid < 0.0) {
             lo = mid;
           } else {
@@ -557,8 +553,8 @@ class PTESolverBase {
         any_jumped = true;
         vfrac[m] = -vfrac[m]; // mark as vapor-jumped for priority normalization
 #ifdef PTE_DEBUG_TRACE
-        std::printf("    mat[%zu]: P=0 bisection done: vfrac=%.6e  rho=%.6e\n",
-                    m, -vfrac[m], robust::ratio(rhobar[m], -vfrac[m]));
+        std::printf("    mat[%zu]: P=0 bisection done: vfrac=%.6e  rho=%.6e\n", m,
+                    -vfrac[m], robust::ratio(rhobar[m], -vfrac[m]));
 #endif
       }
       // else: condition (b) but no spinodal curve — can't jump, skip
@@ -604,21 +600,22 @@ class PTESolverBase {
           any_jumped = true;
 #ifdef PTE_DEBUG_TRACE
           std::printf("    mat[%zu]: degenerate range (hi=%.6e <= lo=%.6e), "
-                      "jumping to vfrac=%.6e (rho_max)\n", m, hi, lo, lo);
+                      "jumping to vfrac=%.6e (rho_max)\n",
+                      m, hi, lo, lo);
 #endif
           continue;
         }
 
         const Real P_lo = eos[m].PressureFromDensityTemperature(
-                              robust::ratio(rhobar[m], lo), T_physical, lambda[m]);
+            robust::ratio(rhobar[m], lo), T_physical, lambda[m]);
         const Real P_hi = eos[m].PressureFromDensityTemperature(
-                              robust::ratio(rhobar[m], hi), T_physical, lambda[m]);
+            robust::ratio(rhobar[m], hi), T_physical, lambda[m]);
 
 #ifdef PTE_DEBUG_TRACE
         std::printf("    mat[%zu]: bisect bounds: lo_vfrac=%.6e (rho=%.6e, P=%.6e)  "
                     "hi_vfrac=%.6e (rho=%.6e, P=%.6e)  P_ref=%.6e\n",
-                    m, lo, robust::ratio(rhobar[m], lo), P_lo,
-                    hi, robust::ratio(rhobar[m], hi), P_hi, P_ref);
+                    m, lo, robust::ratio(rhobar[m], lo), P_lo, hi,
+                    robust::ratio(rhobar[m], hi), P_hi, P_ref);
 #endif
 
         if (P_ref >= P_lo) {
@@ -634,8 +631,7 @@ class PTESolverBase {
           vfrac[m] = hi;
           any_jumped = true;
 #ifdef PTE_DEBUG_TRACE
-          std::printf("    mat[%zu]: P_ref <= P_hi, jumping to Pmin vfrac=%.6e\n",
-                      m, hi);
+          std::printf("    mat[%zu]: P_ref <= P_hi, jumping to Pmin vfrac=%.6e\n", m, hi);
 #endif
           continue;
         }
@@ -644,8 +640,8 @@ class PTESolverBase {
         for (std::size_t iter = 0; iter < max_bisect; ++iter) {
           const Real mid = 0.5 * (lo + hi);
           const Real rho_mid = robust::ratio(rhobar[m], mid);
-          const Real P_mid = eos[m].PressureFromDensityTemperature(
-                                 rho_mid, T_physical, lambda[m]);
+          const Real P_mid =
+              eos[m].PressureFromDensityTemperature(rho_mid, T_physical, lambda[m]);
           if (P_mid > P_ref) {
             lo = mid;
           } else {
@@ -658,10 +654,10 @@ class PTESolverBase {
 #ifdef PTE_DEBUG_TRACE
         {
           const Real rho_final = robust::ratio(rhobar[m], vfrac[m]);
-          const Real P_final = eos[m].PressureFromDensityTemperature(
-                                   rho_final, T_physical, lambda[m]);
-          std::printf("    mat[%zu]: bisection done: vfrac=%.6e  rho=%.6e  P=%.6e\n",
-                      m, vfrac[m], rho_final, P_final);
+          const Real P_final =
+              eos[m].PressureFromDensityTemperature(rho_final, T_physical, lambda[m]);
+          std::printf("    mat[%zu]: bisection done: vfrac=%.6e  rho=%.6e  P=%.6e\n", m,
+                      vfrac[m], rho_final, P_final);
         }
 #endif
       }
@@ -682,7 +678,10 @@ class PTESolverBase {
     // remaining volume proportionally.
     bool has_vapor_jumped = false;
     for (std::size_t m = 0; m < nmat; ++m) {
-      if (vfrac[m] < 0) { has_vapor_jumped = true; break; }
+      if (vfrac[m] < 0) {
+        has_vapor_jumped = true;
+        break;
+      }
     }
     if (has_vapor_jumped) {
       Real vfrac_jumped_sum = 0;
@@ -728,20 +727,19 @@ class PTESolverBase {
     // Recompute state for all materials at the new volume fractions
     for (std::size_t m = 0; m < nmat; ++m) {
       rho[m] = robust::ratio(rhobar[m], vfrac[m]);
-      const Real e_m = eos[m].InternalEnergyFromDensityTemperature(
-                           rho[m], T_physical, lambda[m]);
+      const Real e_m =
+          eos[m].InternalEnergyFromDensityTemperature(rho[m], T_physical, lambda[m]);
       sie[m] = e_m;
       u[m] = robust::ratio(rhobar[m] * e_m, uscale);
       press[m] = robust::ratio(
-          eos[m].PressureFromDensityTemperature(rho[m], T_physical, lambda[m]),
-          uscale);
+          eos[m].PressureFromDensityTemperature(rho[m], T_physical, lambda[m]), uscale);
     }
 
 #ifdef PTE_DEBUG_TRACE
     std::printf("    => Post-jump state:\n");
     for (std::size_t m = 0; m < nmat; ++m) {
-      std::printf("      mat[%zu]: rho=%.6e  vfrac=%.6e  press_phys=%.6e  sie=%.6e\n",
-                  m, rho[m], vfrac[m], press[m] * uscale, sie[m]);
+      std::printf("      mat[%zu]: rho=%.6e  vfrac=%.6e  press_phys=%.6e  sie=%.6e\n", m,
+                  rho[m], vfrac[m], press[m] * uscale, sie[m]);
     }
     std::fflush(stdout);
 #endif
@@ -1571,21 +1569,22 @@ class PTESolverRhoT
   void DebugPrintHeader() const {
 #ifdef PTE_DEBUG_TRACE
     std::printf("=== PTE SOLVER ITERATION TRACE (PTESolverRhoT) ===\n");
-    std::printf("  nmat=%zu  ms(excluded)=%zu  Tnorm=%.6e  uscale=%.6e\n",
-                nmat, ms, Tnorm, uscale);
-    std::printf("  %-5s %-12s %-12s %-5s %-5s", "iter", "err", "Tequil*Tnorm", "conv", "close");
+    std::printf("  nmat=%zu  ms(excluded)=%zu  Tnorm=%.6e  uscale=%.6e\n", nmat, ms,
+                Tnorm, uscale);
+    std::printf("  %-5s %-12s %-12s %-5s %-5s", "iter", "err", "Tequil*Tnorm", "conv",
+                "close");
     for (std::size_t m = 0; m < nmat; ++m)
       std::printf("  rho[%zu]       vfrac[%zu]     P[%zu]*uscale  ", m, m, m);
     std::printf("\n");
 #endif
   }
 
-  void DebugPrintState(std::size_t iter, Real err,
-                       bool converged, bool close_enough) const {
+  void DebugPrintState(std::size_t iter, Real err, bool converged,
+                       bool close_enough) const {
 #ifdef PTE_DEBUG_TRACE
     if (iter == 0) DebugPrintHeader();
-    std::printf("  %-5zu %-12.6e %-12.6e %-5d %-5d",
-                iter, err, Tequil * Tnorm, (int)converged, (int)close_enough);
+    std::printf("  %-5zu %-12.6e %-12.6e %-5d %-5d", iter, err, Tequil * Tnorm,
+                (int)converged, (int)close_enough);
     for (std::size_t m = 0; m < nmat; ++m)
       std::printf("  %-12.6e %-12.6e %-12.6e", rho[m], vfrac[m], press[m] * uscale);
     std::printf("\n");
@@ -2626,6 +2625,14 @@ class PTESolverRhoU
   PORTABLE_INLINE_FUNCTION
   Real GetPhysicalT() const { return 0.0; }
 
+  // PTESolverRhoU has per-material temperatures (not a single equilibrium T),
+  // so the pressure-sign-mismatch jump is not applicable.  Return false to
+  // disable it without special-casing the solver loop.
+  PORTABLE_INLINE_FUNCTION
+  bool TryPressureJump(const Real /*T_physical*/, const MixParams & /*params*/) {
+    return false;
+  }
+
   // No-op debug stubs (only PTESolverRhoT has real prints)
   void DebugPrintState(std::size_t, Real, bool, bool) const {}
   void DebugPrintStep(Real) const {}
@@ -2691,12 +2698,13 @@ PORTABLE_INLINE_FUNCTION SolverStatus PTESolver(System &s) {
     if (std::abs(scale) < params.pte_small_step_thresh) small_step_iters++;
     if (small_step_iters >= params.pte_small_step_tries) {
 #ifdef PTE_DEBUG_TRACE
-      std::printf("[PTESolver] small_step_iters=%zu >= pte_small_step_tries=%zu at iter %zu\n",
-                  small_step_iters, params.pte_small_step_tries, niter);
-      std::printf("[PTESolver] pressure_jump_enabled=%d  attempts=%zu  max_attempts=%zu\n",
-                  (int)params.pte_pressure_jump_enabled,
-                  status.pressure_jump_attempts,
-                  params.pte_pressure_jump_max_attempts);
+      std::printf(
+          "[PTESolver] small_step_iters=%zu >= pte_small_step_tries=%zu at iter %zu\n",
+          small_step_iters, params.pte_small_step_tries, niter);
+      std::printf(
+          "[PTESolver] pressure_jump_enabled=%d  attempts=%zu  max_attempts=%zu\n",
+          (int)params.pte_pressure_jump_enabled, status.pressure_jump_attempts,
+          params.pte_pressure_jump_max_attempts);
 #endif
       // Attempt pressure-sign-mismatch jump before failing out.
       // When a material is trapped in a deep negative-pressure region
@@ -2706,7 +2714,8 @@ PORTABLE_INLINE_FUNCTION SolverStatus PTESolver(System &s) {
           status.pressure_jump_attempts < params.pte_pressure_jump_max_attempts) {
         Real T_phys = s.GetPhysicalT();
 #ifdef PTE_DEBUG_TRACE
-        std::printf("[PTESolver] Attempting pressure jump with T_physical=%.6e\n", T_phys);
+        std::printf("[PTESolver] Attempting pressure jump with T_physical=%.6e\n",
+                    T_phys);
 #endif
         bool jumped = s.TryPressureJump(T_phys, params);
         status.pressure_jump_attempts++;
@@ -2770,19 +2779,18 @@ PORTABLE_INLINE_FUNCTION SolverStatus PTESolver(System &s) {
     // jump.  This catches the failure mode where ScaleDx() never returns a
     // tiny value (so small_step_iters is never incremented) but the solver
     // is drifting linearly with no prospect of convergence.
-    if (status.stagnation_iters >= params.pte_stagnation_tries &&
-        !close_enough) {
+    if (status.stagnation_iters >= params.pte_stagnation_tries && !close_enough) {
       if (params.pte_pressure_jump_enabled &&
           status.pressure_jump_attempts < params.pte_pressure_jump_max_attempts) {
 #ifdef PTE_DEBUG_TRACE
         std::printf("[PTESolver] Stagnation detected: %zu iters with err/err_old > %.4f "
                     "at iter %zu (err=%.6e)\n",
-                    status.stagnation_iters, params.pte_stagnation_thresh,
-                    niter, err);
+                    status.stagnation_iters, params.pte_stagnation_thresh, niter, err);
 #endif
         Real T_phys = s.GetPhysicalT();
 #ifdef PTE_DEBUG_TRACE
-        std::printf("[PTESolver] Attempting pressure jump with T_physical=%.6e\n", T_phys);
+        std::printf("[PTESolver] Attempting pressure jump with T_physical=%.6e\n",
+                    T_phys);
 #endif
         bool jumped = s.TryPressureJump(T_phys, params);
         status.pressure_jump_attempts++;

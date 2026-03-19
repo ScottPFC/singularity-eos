@@ -56,10 +56,9 @@ PORTABLE_FORCEINLINE_FUNCTION Real from_log(const Real lx, const Real offset) {
   return FastMath::pow10(lx) - offset;
 }
 
-inline Real SetRhoPMin(DataBox &P, DataBox &rho_at_pmin,
-                       DataBox &rho_at_spinodal_vapor,
-                       const bool pmin_vapor_dome,
-                       const Real VAPOR_DPDR_THRESH, const Real lRhoOffset) {
+inline Real SetRhoPMin(DataBox &P, DataBox &rho_at_pmin, DataBox &rho_at_spinodal_vapor,
+                       const bool pmin_vapor_dome, const Real VAPOR_DPDR_THRESH,
+                       const Real lRhoOffset) {
   Real PMin = std::numeric_limits<Real>::max();
   const auto lTs = P.range(0);
   const auto lRs = P.range(1);
@@ -86,8 +85,8 @@ inline Real SetRhoPMin(DataBox &P, DataBox &rho_at_pmin,
         Real dr = from_log(lRs.x(j), lRhoOffset) - from_log(lRs.x(j - 2), lRhoOffset);
         Real dpdr = robust::ratio(dP, dr);
         if (dpdr < VAPOR_DPDR_THRESH) {
-          if (jmin_vapor < 0) jmin_vapor = j;  // first unstable point (vapor side)
-          jmax = j;                             // last unstable point (dense side)
+          if (jmin_vapor < 0) jmin_vapor = j; // first unstable point (vapor side)
+          jmax = j;                           // last unstable point (dense side)
         }
       }
     }
@@ -115,6 +114,11 @@ inline Real SetRhoPMin(DataBox &P, DataBox &rho_at_pmin,
     for (int i = NT - 2; i >= 0; i--) {
       if (rho_at_pmin(i) < rho_at_pmin(i + 1)) {
         rho_at_pmin(i) = rho_at_pmin(i + 1);
+      }
+    }
+    for (int i = NT - 2; i >= 0; i--) {
+      if (rho_at_spinodal_vapor(i) < rho_at_spinodal_vapor(i + 1)) {
+        rho_at_spinodal_vapor(i) = rho_at_spinodal_vapor(i + 1);
       }
     }
   }

@@ -260,6 +260,13 @@ class SpinerEOSDependsRhoSieTransformable
   Real RhoPmin(const Real temp) const {
     return rho_at_pmin_.interpToReal(spiner_common::to_log(temp, lTOffset_));
   }
+  PORTABLE_INLINE_FUNCTION
+  Real RhoSpinodalVapor(const Real temp) const {
+    const Real lT = spiner_common::to_log(temp, lTOffset_);
+    if (lT <= sie_.range(0).min()) return rho_at_spinodal_vapor_(0);
+    if (lT >= sie_.range(0).max()) return 0.0;
+    return rho_at_spinodal_vapor_.interpToReal(lT);
+  }
   PORTABLE_FORCEINLINE_FUNCTION int GetNumberofPhases() const { return numphases; }
   const char *GetPhaseNames() const { return phase_names; }
 
@@ -314,6 +321,7 @@ class SpinerEOSDependsRhoSieTransformable
   DataBox sie_; // depends on (rho,T)
   DataBox T_;   // depends on (rho, sie)
   DataBox rho_at_pmin_;
+  DataBox rho_at_spinodal_vapor_;
   SP5Tables dependsRhoT_;
   SP5Tables dependsRhoSie_;
   DataBox mF_;
@@ -332,7 +340,8 @@ class SpinerEOSDependsRhoSieTransformable
       &(dependsRhoT_.dTdE), &(dependsRhoT_.dEdRho), &(dependsRhoSie_.P),                 \
       &(dependsRhoSie_.bMod), &(dependsRhoSie_.dPdRho), &(dependsRhoSie_.dPdE),          \
       &(dependsRhoSie_.dTdRho), &(dependsRhoSie_.dTdE), &(dependsRhoSie_.dEdRho), &mF_,  \
-      &PlRhoMax_, &dPdRhoMax_, &PCold_, &sieCold_, &bModCold_, &dPdRhoCold_
+      &PlRhoMax_, &dPdRhoMax_, &PCold_, &sieCold_, &bModCold_, &dPdRhoCold_,             \
+      &rho_at_spinodal_vapor_
   std::vector<const DataBox *> GetDataBoxPointers_() const {
     return std::vector<const DataBox *>{DBLIST};
   }
@@ -513,8 +522,8 @@ herr_t SpinerEOSDependsRhoSieTransformable<TransformerT>::loadDataboxes_(
   dPdRhoMax_ = dependsRhoT_.dPdRho.slice(numRho_ - 1);
 
   // fill in minimum pressure as a function of temperature
-  PMin_ = SetRhoPMin(dependsRhoT_.P, rho_at_pmin_, pmin_vapor_dome_, VAPOR_DPDR_THRESH,
-                     lRhoOffset_);
+  PMin_ = SetRhoPMin(dependsRhoT_.P, rho_at_pmin_, rho_at_spinodal_vapor_,
+                     pmin_vapor_dome_, VAPOR_DPDR_THRESH, lRhoOffset_);
 
   // reference state
   Real lRhoNormal = to_log(rhoNormal_, lRhoOffset_);
