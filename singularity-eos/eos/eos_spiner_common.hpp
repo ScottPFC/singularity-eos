@@ -116,11 +116,6 @@ inline Real SetRhoPMin(DataBox &P, DataBox &rho_at_pmin, DataBox &rho_at_spinoda
         rho_at_pmin(i) = rho_at_pmin(i + 1);
       }
     }
-    for (int i = NT - 2; i >= 0; i--) {
-      if (rho_at_spinodal_vapor(i) < rho_at_spinodal_vapor(i + 1)) {
-        rho_at_spinodal_vapor(i) = rho_at_spinodal_vapor(i + 1);
-      }
-    }
   }
 
   return PMin;
