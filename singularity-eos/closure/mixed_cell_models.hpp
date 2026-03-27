@@ -1579,7 +1579,10 @@ class PTESolverRhoT
       //////////////////////////////
       // perturb temperature
       //////////////////////////////
-      Real dT = Tequil * params_.derivative_eps;
+      // Use at least derivative_eps in scaled units to prevent vanishing
+      // perturbation when Tequil < 1 (which would place both T and T+dT
+      // below the EOS table floor, yielding zero derivatives).
+      Real dT = std::max(Tequil, 1.0) * params_.derivative_eps;
       e_pert = eos[m].InternalEnergyFromDensityTemperature(rho[m], Tnorm * (Tequil + dT),
                                                            lambda[m]);
       p_pert = robust::ratio(this->GetPressureFromPreferred(eos[m], rho[m],
@@ -1589,6 +1592,9 @@ class PTESolverRhoT
       dpdT[m] = robust::ratio((p_pert - press[m]), dT);
       dedT_sum += robust::ratio(rhobar[m] * robust::ratio(e_pert, uscale) - u[m], dT);
     }
+    // Enforce cv > 0: if EOS clamping made the finite-difference derivative
+    // zero or negative, use a small positive floor to prevent singular Jacobian.
+    dedT_sum = std::max(dedT_sum, params_.min_dtde);
 
     // Fill in the Jacobian
     for (std::size_t i = 0; i < neq * neq; ++i)
@@ -1656,9 +1662,24 @@ class PTESolverRhoT
         scale = std::min(robust::ratio(0.5 * (alpha_max - vfrac[m]), mydx), scale);
       }
     }
-    // control how big of a step toward T = 0 is allowed
-    if (scale * dx[0] < -0.95 * Tequil) {
-      scale = std::min(scale, robust::ratio(-0.95 * Tequil, dx[0]));
+    // Compute minimum allowed scaled temperature from EOS table bounds.
+    // Stepping below Tmin causes the EOS to clamp, producing zero derivatives
+    // and triggering cyclic blow-up in the Newton solver.
+    Real Tequil_min = 0.0;
+    for (std::size_t m = 0; m < nmat; ++m) {
+      Tequil_min = std::max(Tequil_min,
+                            robust::ratio(eos[m].MinimumTemperature(), Tnorm));
+    }
+    const Real T_floor = std::max(0.05 * Tequil, Tequil_min);
+    if (Tequil + scale * dx[0] < T_floor) {
+      if (dx[0] < 0.0 && Tequil > T_floor) {
+        // Limit step so we land exactly at the floor
+        scale = std::min(scale, (Tequil - T_floor) / (-dx[0]));
+      } else if (dx[0] < 0.0) {
+        // Already at or below the floor with a downward step: zero it out
+        // so stagnation detection fires promptly
+        dx[0] = 0.0;
+      }
     }
     // Now apply the overall scaling
     for (std::size_t i = 0; i < neq; ++i)
@@ -1947,7 +1968,7 @@ class PTESolverPT
       //////////////////////////////
       // perturb temperatures
       //////////////////////////////
-      Real dT = Tequil * params_.derivative_eps;
+      Real dT = std::max(Tequil, 1.0) * params_.derivative_eps;
       eos[m].DensityEnergyFromPressureTemperature(uscale * Pequil, Tnorm * (Tequil + dT),
                                                   lambda[m], r_pert, e_pert);
       Real drdT = robust::ratio(r_pert - rho[m], dT);
@@ -2415,7 +2436,7 @@ class PTESolverFixedP
       //////////////////////////////
       // perturb temperature
       //////////////////////////////
-      Real dT = Tequil * params_.derivative_eps;
+      Real dT = std::max(Tequil, 1.0) * params_.derivative_eps;
 
       p_pert = robust::ratio(this->GetPressureFromPreferred(eos[m], rho[m],
                                                             Tnorm * (Tequil + dT), e_pert,
