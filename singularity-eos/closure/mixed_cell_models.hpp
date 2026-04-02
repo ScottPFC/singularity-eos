@@ -2744,14 +2744,17 @@ PORTABLE_INLINE_FUNCTION SolverStatus PTESolver(System &s) {
     auto check = s.CheckPTE();
     converged = check.first;
     close_enough = check.second;
-    s.DebugPrintState(niter, err, converged, close_enough);
-    if (converged) break;
+    if (converged) {
+      s.DebugPrintState(niter, err, converged, close_enough);
+      break;
+    }
 
     // compute the Jacobian
     s.Jacobian();
 
     // solve for the Newton step
     bool success = s.Solve();
+    s.DebugPrintState(niter, err, converged, close_enough);
     if (!success) {
       // do something to crash out?  Tell folks what happened?
       // printf("crashing out at iteration: %ld\n", niter);
