@@ -344,7 +344,7 @@ class PTESolverBase {
     // dP/drho ≈ 0 and the Jacobian is ill-conditioned.  Used on both
     // sides: vapor-side (target = spinodal_safety * RhoSpinodalVapor)
     // and dense-side (bisection upper bound at rho > RhoPmin).
-    static constexpr Real spinodal_safety = 0.9;
+    constexpr Real spinodal_safety = 0.9;
 
 #ifdef PTE_DEBUG_TRACE
     std::printf("  [TryPressureJump] T_physical=%.6e  abs_tol_p=%.6e  max_bisect=%zu\n",
@@ -452,12 +452,12 @@ class PTESolverBase {
     // dense-side spinodal where dP/drho ~ 0 causes solver stagnation.
     // A tight margin (5%) ensures we only jump materials that are
     // genuinely stuck right at the pressure minimum.
-    static constexpr Real pinned_margin = 1.05;
+    constexpr Real pinned_margin = 1.05;
     // Defensive density floor for the P=0 bisection upper bound.
     // Prevents the bisection from exploring densities where the EOS may
     // not be well-defined.  In practice vfrac_hi_max almost always binds
     // first; this only matters when rhobar is extremely small.
-    static constexpr Real min_bisection_density = 1.0e-12;
+    constexpr Real min_bisection_density = 1.0e-12;
 
     const Real vfrac_hi_max = vfrac_total - min_vfrac * (nmat - 1);
 #ifdef PTE_DEBUG_TRACE
@@ -616,7 +616,7 @@ class PTESolverBase {
     // reliable enough to use as a reference (P_ref).  Materials within
     // this band of RhoPmin have small dP/drho and their pressure values
     // may not be trustworthy targets for bisection.
-    static constexpr Real stable_ref_margin = 1.5;
+    constexpr Real stable_ref_margin = 1.5;
 
 #ifdef PTE_DEBUG_TRACE
     std::printf("    => Dense-side fallback: spinodal equilibration\n");
