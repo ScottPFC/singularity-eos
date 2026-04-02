@@ -334,6 +334,19 @@ class PTESolverBase {
     const Real abs_tol_p = params.pte_abs_tolerance_p;
     const std::size_t max_bisect = params.pte_pressure_jump_bisect_iters;
 
+    // Margin around RhoPmin for detecting materials near the dense-side
+    // spinodal.  A 50% margin catches materials pinned at the spinodal
+    // boundary where dP/drho ~ 0 causes solver stagnation.
+    static constexpr Real spinodal_margin = 1.5;
+    // Safety factor for jumping to vapor-side spinodal density -- land
+    // slightly inside the stable region rather than exactly on the boundary.
+    static constexpr Real vapor_jump_safety = 0.9;
+    // Defensive density floor for the P=0 bisection upper bound.
+    // Prevents the bisection from exploring densities where the EOS may
+    // not be well-defined.  In practice vfrac_hi_max almost always binds
+    // first; this only matters when rhobar is extremely small.
+    static constexpr Real min_bisection_density = 1.0e-12;
+
 #ifdef PTE_DEBUG_TRACE
     std::printf("  [TryPressureJump] T_physical=%.6e  abs_tol_p=%.6e  max_bisect=%zu\n",
                 T_physical, abs_tol_p, max_bisect);
@@ -360,8 +373,8 @@ class PTESolverBase {
     bool any_jumped = false;
 
     // Find dominant material (largest vfrac) as the pressure reference.
-    // Moved up from Path B so it's available for both the unified vapor-side
-    // jump and the Path B fallback.
+    // Needed for both the unified vapor-side jump and the spinodal-crossing
+    // pressure equilibration fallback below.
     std::size_t dom = 0;
     for (std::size_t m = 1; m < nmat; ++m) {
       if (vfrac[m] > vfrac[dom]) dom = m;
@@ -373,7 +386,7 @@ class PTESolverBase {
     // material as the pressure reference instead, and allow the dom
     // material to be checked for vapor-side jumps.
     //
-    // The threshold uses the same 1.5*RhoPmin margin as condition (b)
+    // The threshold uses the same spinodal_margin * RhoPmin as condition (b)
     // to catch materials pinned AT the spinodal (rho ≈ RhoPmin) in
     // addition to those that have drifted past it (rho < RhoPmin).
     bool dom_in_unstable = false;
@@ -381,12 +394,12 @@ class PTESolverBase {
       const Real rho_pmin_dom = eos[dom].RhoPmin(T_physical);
 #ifdef PTE_DEBUG_TRACE
       std::printf("    dom_in_unstable check: dom=%zu  rho[dom]=%.6e  "
-                  "RhoPmin(T=%.6e)=%.6e  1.5*RhoPmin=%.6e  "
-                  "test=(rho_pmin_dom>0 && rho<=1.5*rho_pmin)=%d\n",
-                  dom, rho[dom], T_physical, rho_pmin_dom, 1.5 * rho_pmin_dom,
-                  (int)(rho_pmin_dom > 0 && rho[dom] <= 1.5 * rho_pmin_dom));
+                  "RhoPmin(T=%.6e)=%.6e  margin*RhoPmin=%.6e  "
+                  "test=(rho_pmin_dom>0 && rho<=margin*rho_pmin)=%d\n",
+                  dom, rho[dom], T_physical, rho_pmin_dom, spinodal_margin * rho_pmin_dom,
+                  (int)(rho_pmin_dom > 0 && rho[dom] <= spinodal_margin * rho_pmin_dom));
 #endif
-      if (rho_pmin_dom > 0 && rho[dom] <= 1.5 * rho_pmin_dom) {
+      if (rho_pmin_dom > 0 && rho[dom] <= spinodal_margin * rho_pmin_dom) {
         dom_in_unstable = true;
       }
     }
@@ -399,6 +412,10 @@ class PTESolverBase {
       for (std::size_t m = 0; m < nmat; ++m) {
         if (m == dom) continue;
         const Real rpm = eos[m].RhoPmin(T_physical);
+        // Strict rho > rpm (no spinodal_margin) because we need a genuinely
+        // stable material for a reliable P_ref, unlike the dom_in_unstable
+        // check which uses a wider margin to flag potentially unreliable
+        // pressures.
         bool m_stable = (rpm <= 0 || rho[m] > rpm);
         if (m_stable && vfrac[m] > best_vfrac) {
           best_vfrac = vfrac[m];
@@ -463,7 +480,8 @@ class PTESolverBase {
       // dP/drho ≈ 0 here, so Newton stagnates regardless of P vs P_ref.
       // The equilibrium may be at lower rho in the unstable region where
       // P rises toward the vapor-side peak.
-      else if (rho_pmin > 0 && rho[m] >= rho_pmin && rho[m] <= 1.5 * rho_pmin) {
+      else if (rho_pmin > 0 && rho[m] >= rho_pmin &&
+               rho[m] <= spinodal_margin * rho_pmin) {
         need_vapor_jump = true;
 #ifdef PTE_DEBUG_TRACE
         std::printf("    mat[%zu]: PINNED at spinodal (rho=%.6e, RhoPmin=%.6e, "
@@ -474,8 +492,8 @@ class PTESolverBase {
       // Condition (c): drifted past dense-side spinodal into unstable region.
       // The ScaleDx escape hatch allowed rho to drop below RhoPmin.
       // If the material is between the two spinodal edges, jump to the
-      // vapor-side stable branch rather than letting Path B push it back
-      // to the dense side.
+      // vapor-side stable branch rather than letting the dense-side
+      // fallback below push it back to the dense side.
       else if (rho_pmin > 0 && rho[m] < rho_pmin) {
         const Real rho_vapor = eos[m].RhoSpinodalVapor(T_physical);
         if (rho_vapor > 0 && rho[m] > rho_vapor) {
@@ -499,21 +517,22 @@ class PTESolverBase {
 
       const Real rho_vapor = eos[m].RhoSpinodalVapor(T_physical);
       if (rho_vapor > 0) {
-        // Jump to vapor-side stable region (0.9 safety factor)
-        vfrac[m] = std::min(robust::ratio(rhobar[m], 0.9 * rho_vapor), vfrac_hi_max);
+        // Jump to vapor-side stable region
+        vfrac[m] = std::min(robust::ratio(rhobar[m], vapor_jump_safety * rho_vapor),
+                            vfrac_hi_max);
         any_jumped = true;
         vfrac[m] = -vfrac[m]; // mark as vapor-jumped for priority normalization
 #ifdef PTE_DEBUG_TRACE
         std::printf("    mat[%zu]: VAPOR JUMP to RhoSpinodalVapor=%.6e "
-                    "(0.9*=%.6e), vfrac=%.6e, rho=%.6e\n",
-                    m, rho_vapor, 0.9 * rho_vapor, -vfrac[m],
+                    "(safety*=%.6e), vfrac=%.6e, rho=%.6e\n",
+                    m, rho_vapor, vapor_jump_safety * rho_vapor, -vfrac[m],
                     robust::ratio(rhobar[m], -vfrac[m]));
 #endif
       } else if (phys_press < -abs_tol_p) {
         // Fallback: P=0 bisection for materials without pmin_vapor_dome
-        // (no precomputed spinodal curve).  Original Path A logic.
+        // (no precomputed spinodal curve).
         const Real lo_init = vfrac[m];
-        Real hi = std::min(vfrac_hi_max, robust::ratio(rhobar[m], 1.0e-12));
+        Real hi = std::min(vfrac_hi_max, robust::ratio(rhobar[m], min_bisection_density));
 #ifdef PTE_DEBUG_TRACE
         std::printf("    mat[%zu]: no spinodal curve, fallback P=0 bisection "
                     "lo=%.6e  hi=%.6e\n",
@@ -562,14 +581,14 @@ class PTESolverBase {
 
     if (!any_jumped && has_positive && !has_negative) {
       // =================================================================
-      // Path B fallback: Spinodal-crossing pressure equilibration.
+      // Dense-side fallback: Spinodal-crossing pressure equilibration.
       // All pressures are positive, no vapor-side jumps were made.
       // Check for materials on the unstable side of the spinodal
       // (rho < RhoPmin) and jump them to the stable (dense) side,
       // targeting the dominant material's pressure.
       // =================================================================
 #ifdef PTE_DEBUG_TRACE
-      std::printf("    => Path B fallback: spinodal equilibration\n");
+      std::printf("    => Dense-side fallback: spinodal equilibration\n");
 #endif
 
       for (std::size_t m = 0; m < nmat; ++m) {
@@ -593,7 +612,7 @@ class PTESolverBase {
         // Bisect vfrac on the stable (dense) side to find P = P_ref.
         const Real rho_max = eos[m].MaximumDensity();
         Real lo = std::max(min_vfrac, robust::ratio(rhobar[m], rho_max));
-        Real hi = 0.9 * robust::ratio(rhobar[m], rho_pmin);
+        Real hi = vapor_jump_safety * robust::ratio(rhobar[m], rho_pmin);
 
         if (hi <= lo) {
           vfrac[m] = lo;
@@ -674,8 +693,14 @@ class PTESolverBase {
 
     // Renormalize volume fractions so they sum to vfrac_total.
     // Priority normalization: vapor-jumped materials (marked with negative
-    // vfrac) keep their target vfrac; non-jumped materials share the
-    // remaining volume proportionally.
+    // vfrac) keep their target vfrac; non-jumped materials (including dom)
+    // share the remaining volume proportionally.
+    //
+    // Note: dom is not preserved here -- it must absorb whatever volume
+    // remains after jumped materials take their share.  In the 2-material
+    // case dom is the only non-jumped material, so it takes the entire
+    // remainder by necessity.  This is an initial guess improvement; the
+    // Newton solver re-equilibrates pressures from the new starting point.
     bool has_vapor_jumped = false;
     for (std::size_t m = 0; m < nmat; ++m) {
       if (vfrac[m] < 0) {
@@ -1566,6 +1591,7 @@ class PTESolverRhoT
   Real GetPhysicalT() const { return Tnorm * Tequil; }
 
   // === DEBUG PRINTS (enabled with -DPTE_DEBUG_TRACE) ===
+  PORTABLE_INLINE_FUNCTION
   void DebugPrintHeader() const {
 #ifdef PTE_DEBUG_TRACE
     std::printf("=== PTE SOLVER ITERATION TRACE (PTESolverRhoT) ===\n");
@@ -1579,6 +1605,7 @@ class PTESolverRhoT
 #endif
   }
 
+  PORTABLE_INLINE_FUNCTION
   void DebugPrintState(std::size_t iter, Real err, bool converged,
                        bool close_enough) const {
 #ifdef PTE_DEBUG_TRACE
@@ -1618,6 +1645,7 @@ class PTESolverRhoT
 #endif
   }
 
+  PORTABLE_INLINE_FUNCTION
   void DebugPrintStep(Real scale) const {
 #ifdef PTE_DEBUG_TRACE
     std::printf("    ScaleDx -> scale=%.6e\n", scale);
@@ -1875,7 +1903,9 @@ class PTESolverPT
   Real GetPhysicalT() const { return Tnorm * Tequil; }
 
   // No-op debug stubs (only PTESolverRhoT has real prints)
+  PORTABLE_INLINE_FUNCTION
   void DebugPrintState(std::size_t, Real, bool, bool) const {}
+  PORTABLE_INLINE_FUNCTION
   void DebugPrintStep(Real) const {}
 
  private:
@@ -2106,7 +2136,9 @@ class PTESolverFixedT
   Real GetPhysicalT() const { return Tnorm * Tequil; }
 
   // No-op debug stubs (only PTESolverRhoT has real prints)
+  PORTABLE_INLINE_FUNCTION
   void DebugPrintState(std::size_t, Real, bool, bool) const {}
+  PORTABLE_INLINE_FUNCTION
   void DebugPrintStep(Real) const {}
 
  private:
@@ -2358,7 +2390,9 @@ class PTESolverFixedP
   Real GetPhysicalT() const { return Tnorm * Tequil; }
 
   // No-op debug stubs (only PTESolverRhoT has real prints)
+  PORTABLE_INLINE_FUNCTION
   void DebugPrintState(std::size_t, Real, bool, bool) const {}
+  PORTABLE_INLINE_FUNCTION
   void DebugPrintStep(Real) const {}
 
  private:
@@ -2634,7 +2668,9 @@ class PTESolverRhoU
   }
 
   // No-op debug stubs (only PTESolverRhoT has real prints)
+  PORTABLE_INLINE_FUNCTION
   void DebugPrintState(std::size_t, Real, bool, bool) const {}
+  PORTABLE_INLINE_FUNCTION
   void DebugPrintStep(Real) const {}
 
  private:
