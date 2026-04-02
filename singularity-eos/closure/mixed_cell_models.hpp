@@ -334,10 +334,16 @@ class PTESolverBase {
     const Real abs_tol_p = params.pte_abs_tolerance_p;
     const std::size_t max_bisect = params.pte_pressure_jump_bisect_iters;
 
-    // Margin around RhoPmin for detecting materials near the dense-side
-    // spinodal.  A 50% margin catches materials pinned at the spinodal
-    // boundary where dP/drho ~ 0 causes solver stagnation.
-    static constexpr Real spinodal_margin = 1.5;
+    // Margin around RhoPmin for detecting materials pinned at the
+    // dense-side spinodal where dP/drho ~ 0 causes solver stagnation.
+    // A tight margin (5%) ensures we only jump materials that are
+    // genuinely stuck right at the pressure minimum.
+    static constexpr Real pinned_margin = 1.05;
+    // Wider margin for determining whether a material's pressure is
+    // reliable enough to use as a reference (P_ref).  Materials within
+    // this band of RhoPmin have small dP/drho and their pressure values
+    // may not be trustworthy targets for bisection.
+    static constexpr Real stable_ref_margin = 1.5;
     // Safety factor for jumping to vapor-side spinodal density -- land
     // slightly inside the stable region rather than exactly on the boundary.
     static constexpr Real vapor_jump_safety = 0.9;
@@ -372,73 +378,9 @@ class PTESolverBase {
 #endif
     bool any_jumped = false;
 
-    // Find dominant material (largest vfrac) as the pressure reference.
-    // Needed for both the unified vapor-side jump and the spinodal-crossing
-    // pressure equilibration fallback below.
-    std::size_t dom = 0;
-    for (std::size_t m = 1; m < nmat; ++m) {
-      if (vfrac[m] > vfrac[dom]) dom = m;
-    }
-
-    // Check if dom itself is at or near its dense-side spinodal.
-    // If so, its pressure is unreliable (in the unstable region or at
-    // the spinodal where dP/drho ≈ 0).  Use the largest-vfrac stable
-    // material as the pressure reference instead, and allow the dom
-    // material to be checked for vapor-side jumps.
-    //
-    // The threshold uses the same spinodal_margin * RhoPmin as condition (b)
-    // to catch materials pinned AT the spinodal (rho ≈ RhoPmin) in
-    // addition to those that have drifted past it (rho < RhoPmin).
-    bool dom_in_unstable = false;
-    {
-      const Real rho_pmin_dom = eos[dom].RhoPmin(T_physical);
-#ifdef PTE_DEBUG_TRACE
-      std::printf("    dom_in_unstable check: dom=%zu  rho[dom]=%.6e  "
-                  "RhoPmin(T=%.6e)=%.6e  margin*RhoPmin=%.6e  "
-                  "test=(rho_pmin_dom>0 && rho<=margin*rho_pmin)=%d\n",
-                  dom, rho[dom], T_physical, rho_pmin_dom, spinodal_margin * rho_pmin_dom,
-                  (int)(rho_pmin_dom > 0 && rho[dom] <= spinodal_margin * rho_pmin_dom));
-#endif
-      if (rho_pmin_dom > 0 && rho[dom] <= spinodal_margin * rho_pmin_dom) {
-        dom_in_unstable = true;
-      }
-    }
-
-    Real P_ref;
-    if (dom_in_unstable) {
-      // Find the largest-vfrac material that is NOT in the unstable region
-      std::size_t ref_mat = dom; // fallback if all materials are unstable
-      Real best_vfrac = -1.0;
-      for (std::size_t m = 0; m < nmat; ++m) {
-        if (m == dom) continue;
-        const Real rpm = eos[m].RhoPmin(T_physical);
-        // Use the same spinodal_margin as the dom_in_unstable check:
-        // if dP/drho ≈ 0 makes a pressure unreliable for the dominant,
-        // it is equally unreliable for any candidate reference.
-        bool m_stable = (rpm <= 0 || rho[m] > spinodal_margin * rpm);
-        if (m_stable && vfrac[m] > best_vfrac) {
-          best_vfrac = vfrac[m];
-          ref_mat = m;
-        }
-      }
-      P_ref = press[ref_mat] * uscale;
-#ifdef PTE_DEBUG_TRACE
-      std::printf("    dominant mat=%zu is UNSTABLE (rho=%.6e <= RhoPmin=%.6e), "
-                  "P_ref from mat[%zu]=%.6e\n",
-                  dom, rho[dom], eos[dom].RhoPmin(T_physical), ref_mat, P_ref);
-#endif
-    } else {
-      P_ref = press[dom] * uscale;
-    }
     const Real vfrac_hi_max = vfrac_total - min_vfrac * (nmat - 1);
-
 #ifdef PTE_DEBUG_TRACE
-    if (!dom_in_unstable) {
-      std::printf("    dominant mat=%zu  vfrac=%.6e  P_ref=%.6e  vfrac_hi_max=%.6e\n",
-                  dom, vfrac[dom], P_ref, vfrac_hi_max);
-    } else {
-      std::printf("    vfrac_hi_max=%.6e\n", vfrac_hi_max);
-    }
+    std::printf("    vfrac_hi_max=%.6e\n", vfrac_hi_max);
 #endif
 
     // =================================================================
@@ -449,7 +391,7 @@ class PTESolverBase {
     //       stagnates because dP/drho ≈ 0 at the spinodal boundary
     //       (ill-conditioned Jacobian).  RhoPmin is a local P minimum,
     //       so the equilibrium can be at lower rho (in the unstable
-    //       region where P is higher) regardless of P vs P_ref.
+    //       region where P is higher).
     //   (c) Drifted past spinodal into unstable region — rho < RhoPmin
     //       but rho > RhoSpinodalVapor.  The ScaleDx escape hatch
     //       allowed rho to drop below RhoPmin during Newton iteration.
@@ -457,12 +399,11 @@ class PTESolverBase {
     // In all cases the target is RhoSpinodalVapor(T) — the precomputed
     // vapor-side boundary of the stable region.
     //
-    // When dom_in_unstable, the dominant material is also checked
-    // (normally skipped since its pressure defines P_ref).
+    // All materials are checked uniformly; the jump conditions
+    // themselves correctly identify which materials need intervention.
     // =================================================================
 
     for (std::size_t m = 0; m < nmat; ++m) {
-      if (m == dom && !dom_in_unstable) continue;
       const Real phys_press = press[m] * uscale;
       const Real rho_pmin = eos[m].RhoPmin(T_physical);
 
@@ -476,16 +417,16 @@ class PTESolverBase {
 #endif
       }
       // Condition (b): pinned at dense-side spinodal (local P minimum).
-      // dP/drho ≈ 0 here, so Newton stagnates regardless of P vs P_ref.
-      // The equilibrium may be at lower rho in the unstable region where
-      // P rises toward the vapor-side peak.
+      // dP/drho ≈ 0 here, so Newton stagnates.  The equilibrium may be
+      // at lower rho in the unstable region where P rises toward the
+      // vapor-side peak.
       else if (rho_pmin > 0 && rho[m] >= rho_pmin &&
-               rho[m] <= spinodal_margin * rho_pmin) {
+               rho[m] <= pinned_margin * rho_pmin) {
         need_vapor_jump = true;
 #ifdef PTE_DEBUG_TRACE
         std::printf("    mat[%zu]: PINNED at spinodal (rho=%.6e, RhoPmin=%.6e, "
-                    "P=%.6e, P_ref=%.6e), need vapor jump\n",
-                    m, rho[m], rho_pmin, phys_press, P_ref);
+                    "P=%.6e), need vapor jump\n",
+                    m, rho[m], rho_pmin, phys_press);
 #endif
       }
       // Condition (c): drifted past dense-side spinodal into unstable region.
@@ -584,14 +525,46 @@ class PTESolverBase {
       // All pressures are positive, no vapor-side jumps were made.
       // Check for materials on the unstable side of the spinodal
       // (rho < RhoPmin) and jump them to the stable (dense) side,
-      // targeting the dominant material's pressure.
+      // targeting P_ref — the vfrac-weighted average pressure of all
+      // stable materials.
       // =================================================================
 #ifdef PTE_DEBUG_TRACE
       std::printf("    => Dense-side fallback: spinodal equilibration\n");
 #endif
 
+      // Compute P_ref as vfrac-weighted average of stable material pressures.
+      // A material is considered stable if it is well outside the spinodal
+      // region: either rho > stable_ref_margin * RhoPmin (dense-side stable)
+      // or RhoPmin <= 0 (no spinodal for this EOS).  Materials on the
+      // vapor side (rho < RhoSpinodalVapor) are also stable but are
+      // unlikely to reach this path (they would have been vapor-jumped).
+      Real P_ref_num = 0;
+      Real P_ref_den = 0;
       for (std::size_t m = 0; m < nmat; ++m) {
-        if (m == dom && !dom_in_unstable) continue;
+        const Real rpm = eos[m].RhoPmin(T_physical);
+        bool m_stable = (rpm <= 0 || rho[m] > stable_ref_margin * rpm);
+        if (m_stable) {
+          P_ref_num += vfrac[m] * press[m] * uscale;
+          P_ref_den += vfrac[m];
+        }
+      }
+      // Fallback: if no material is stable, use the largest-vfrac
+      // material's pressure as a best-effort reference.
+      Real P_ref;
+      if (P_ref_den > 0) {
+        P_ref = P_ref_num / P_ref_den;
+      } else {
+        std::size_t dom = 0;
+        for (std::size_t m = 1; m < nmat; ++m) {
+          if (vfrac[m] > vfrac[dom]) dom = m;
+        }
+        P_ref = press[dom] * uscale;
+      }
+#ifdef PTE_DEBUG_TRACE
+      std::printf("    P_ref=%.6e\n", P_ref);
+#endif
+
+      for (std::size_t m = 0; m < nmat; ++m) {
         const Real rho_pmin = eos[m].RhoPmin(T_physical);
 #ifdef PTE_DEBUG_TRACE
         std::printf("    mat[%zu]: rho=%.6e  RhoPmin=%.6e", m, rho[m], rho_pmin);
@@ -692,14 +665,11 @@ class PTESolverBase {
 
     // Renormalize volume fractions so they sum to vfrac_total.
     // Priority normalization: vapor-jumped materials (marked with negative
-    // vfrac) keep their target vfrac; non-jumped materials (including dom)
-    // share the remaining volume proportionally.
+    // vfrac) keep their target vfrac; non-jumped materials share the
+    // remaining volume proportionally.
     //
-    // Note: dom is not preserved here -- it must absorb whatever volume
-    // remains after jumped materials take their share.  In the 2-material
-    // case dom is the only non-jumped material, so it takes the entire
-    // remainder by necessity.  This is an initial guess improvement; the
-    // Newton solver re-equilibrates pressures from the new starting point.
+    // This is an initial guess improvement; the Newton solver
+    // re-equilibrates pressures from the new starting point.
     bool has_vapor_jumped = false;
     for (std::size_t m = 0; m < nmat; ++m) {
       if (vfrac[m] < 0) {
