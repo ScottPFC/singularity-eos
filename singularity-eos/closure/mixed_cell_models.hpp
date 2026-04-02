@@ -536,8 +536,9 @@ class PTESolverBase {
       // A material is considered stable if it is well outside the spinodal
       // region: either rho > stable_ref_margin * RhoPmin (dense-side stable)
       // or RhoPmin <= 0 (no spinodal for this EOS).  Materials on the
-      // vapor side (rho < RhoSpinodalVapor) are also stable but are
-      // unlikely to reach this path (they would have been vapor-jumped).
+      // vapor side (rho < RhoSpinodalVapor) are also stable and will
+      // contribute to P_ref here; they are explicitly skipped in the
+      // per-material jump loop below.
       Real P_ref_num = 0;
       Real P_ref_den = 0;
       for (std::size_t m = 0; m < nmat; ++m) {
@@ -570,17 +571,33 @@ class PTESolverBase {
         std::printf("    mat[%zu]: rho=%.6e  RhoPmin=%.6e", m, rho[m], rho_pmin);
 #endif
         if (rho[m] >= rho_pmin) {
-          // On the stable side of the spinodal — Newton can handle this
+          // On the dense-stable side of the spinodal — Newton can handle this
 #ifdef PTE_DEBUG_TRACE
-          std::printf("  STABLE, skipping\n");
+          std::printf("  DENSE-STABLE, skipping\n");
 #endif
           continue;
         }
+        // Check if material is already on the vapor-stable branch
+        // (past the vapor-side spinodal).  Only push materials back to
+        // the dense side if they are genuinely in the unstable region.
+        // For materials without a vapor spinodal curve (RhoSpinodalVapor
+        // returns 0), we can't determine vapor stability, so we
+        // conservatively proceed with the dense-side jump.
+        {
+          const Real rho_vapor = eos[m].RhoSpinodalVapor(T_physical);
+          if (rho_vapor > 0 && rho[m] <= rho_vapor) {
 #ifdef PTE_DEBUG_TRACE
-        std::printf("  ON SPINODAL — need to jump\n");
+            std::printf("  VAPOR-STABLE (rho=%.6e <= RhoSpinodalVapor=%.6e), skipping\n",
+                        rho[m], rho_vapor);
+#endif
+            continue;
+          }
+        }
+#ifdef PTE_DEBUG_TRACE
+        std::printf("  UNSTABLE — need dense-side jump\n");
 #endif
 
-        // Material m is on the unstable side (rho < RhoPmin, dP/dV > 0).
+        // Material m is in the unstable region (RhoSpinodalVapor < rho < RhoPmin).
         // Bisect vfrac on the stable (dense) side to find P = P_ref.
         const Real rho_max = eos[m].MaximumDensity();
         Real lo = std::max(min_vfrac, robust::ratio(rhobar[m], rho_max));
