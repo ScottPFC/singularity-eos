@@ -458,11 +458,13 @@ class PTESolverBase {
     // not be well-defined.  In practice vfrac_hi_max almost always binds
     // first; this only matters when rhobar is extremely small.
     constexpr Real min_bisection_density = 1.0e-12;
-
-    const Real vfrac_hi_max = vfrac_total - min_vfrac * (nmat - 1);
-#ifdef PTE_DEBUG_TRACE
-    std::printf("    vfrac_hi_max=%.6e\n", vfrac_hi_max);
-#endif
+    // Maximum factor by which non-jumped materials' densities may
+    // increase as a result of the jump.  Limits the jumped material's
+    // vfrac so that other materials keep vfrac >= vfrac_current / cap,
+    // i.e. rho_post <= cap * rho_current.  Prevents the priority
+    // normalization from crushing minority materials into extreme
+    // densities that the solver cannot recover from.
+    constexpr Real density_change_cap = 10.0;
 
     bool any_jumped = false;
 
@@ -517,6 +519,18 @@ class PTESolverBase {
 #endif
         continue;
       }
+
+      // Maximum vfrac this material can take without increasing other
+      // materials' densities by more than density_change_cap.
+      Real vfrac_hi_max = vfrac_total;
+      for (std::size_t k = 0; k < nmat; ++k) {
+        if (k == m) continue;
+        vfrac_hi_max -= std::max(min_vfrac, vfrac[k] / density_change_cap);
+      }
+      vfrac_hi_max = std::max(vfrac_hi_max, min_vfrac);
+#ifdef PTE_DEBUG_TRACE
+      std::printf("    mat[%zu]: vfrac_hi_max=%.6e\n", m, vfrac_hi_max);
+#endif
 
       const Real rho_vapor = eos[m].RhoSpinodalVapor(T_physical);
       if (rho_vapor > 0) {
