@@ -547,12 +547,17 @@ class PTESolverBase {
         const Real P_hi =
             eos[m].PressureFromDensityTemperature(rho_hi, T_physical, lambda[m]);
         if (P_hi < 0.0) {
-          if (std::abs(P_hi) < std::abs(phys_press) * 0.5) {
+          // No P=0 crossing exists in the feasible range.  Jump anyway
+          // if expanding to maximum feasible density reduces the magnitude
+          // of negative pressure, giving Newton a better starting point.
+          if (std::abs(P_hi) < std::abs(phys_press)) {
             vfrac[m] = hi;
             any_jumped = true;
             vfrac[m] = -vfrac[m]; // mark as vapor-jumped for priority normalization
 #ifdef PTE_DEBUG_TRACE
-            std::printf("    mat[%zu]: P_hi<0 but improving, jump to hi=%.6e\n", m, hi);
+            std::printf("    mat[%zu]: P_hi<0 but improving (%.6e -> %.6e), "
+                        "jump to hi=%.6e\n",
+                        m, phys_press, P_hi, hi);
 #endif
           }
           continue;
