@@ -363,8 +363,8 @@ class PTESolverBase {
 
     // Phase 2: Dense-side fallback (only if no vapor jumps were made)
     if (!any_jumped) {
-      any_jumped = TryDenseSideJump(T_physical, abs_tol_p, max_bisect,
-                                    min_vfrac, spinodal_safety);
+      any_jumped = TryDenseSideJump(T_physical, max_bisect,
+                                      min_vfrac, spinodal_safety);
     }
 
     if (!any_jumped) {
@@ -593,20 +593,23 @@ class PTESolverBase {
   // -----------------------------------------------------------------
   // TryPressureJump helper: dense-side spinodal equilibration.
   //
-  // All pressures are positive, no vapor-side jumps were made.
-  // Check for materials on the unstable side of the spinodal
-  // (rho < RhoPmin) and jump them to the stable (dense) side,
-  // targeting P_ref — the vfrac-weighted average pressure of all
-  // stable materials.
+  // No vapor-side jumps were made.  Check for materials on the
+  // unstable side of the spinodal (rho < RhoPmin) and jump them to
+  // the stable (dense) side, targeting P_ref — the vfrac-weighted
+  // average pressure of all stable materials.
   //
-  // This path only fires when all pressures are positive (no sign
-  // mismatch): the sign mismatch check is performed internally.
+  // Valid regardless of pressure signs: P_ref is computed from stable
+  // materials only, and the bisection bounds handle out-of-range
+  // targets by clamping to the nearest endpoint on the dense-stable
+  // branch.  Even when P_ref is negative, the jump moves the material
+  // onto a branch where dP/drho > 0 and the Jacobian is well-
+  // conditioned, allowing Newton to make progress.
   //
   // Jumped materials keep positive vfrac (no sign convention needed)
   // since they are being pushed to the dense side, not the vapor side.
   // -----------------------------------------------------------------
   PORTABLE_INLINE_FUNCTION
-  bool TryDenseSideJump(const Real T_physical, const Real abs_tol_p,
+  bool TryDenseSideJump(const Real T_physical,
                         const std::size_t max_bisect, const Real min_vfrac,
                         const Real spinodal_safety) {
     // Wider margin for determining whether a material's pressure is
@@ -614,23 +617,6 @@ class PTESolverBase {
     // this band of RhoPmin have small dP/drho and their pressure values
     // may not be trustworthy targets for bisection.
     static constexpr Real stable_ref_margin = 1.5;
-
-    // Precondition: only fire when all pressures are positive.
-    // If any material has deeply negative pressure, the vapor-side jump
-    // should have handled it; if all are negative, there is nothing we
-    // can do.
-    bool has_negative = false;
-    bool has_positive = false;
-    for (std::size_t m = 0; m < nmat; ++m) {
-      const Real phys_press = press[m] * uscale;
-      if (phys_press < -abs_tol_p) has_negative = true;
-      if (phys_press > abs_tol_p) has_positive = true;
-    }
-#ifdef PTE_DEBUG_TRACE
-    std::printf("    has_negative=%d  has_positive=%d\n", (int)has_negative,
-                (int)has_positive);
-#endif
-    if (!has_positive || has_negative) return false;
 
 #ifdef PTE_DEBUG_TRACE
     std::printf("    => Dense-side fallback: spinodal equilibration\n");
