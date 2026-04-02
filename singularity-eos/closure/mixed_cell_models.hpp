@@ -412,11 +412,10 @@ class PTESolverBase {
       for (std::size_t m = 0; m < nmat; ++m) {
         if (m == dom) continue;
         const Real rpm = eos[m].RhoPmin(T_physical);
-        // Strict rho > rpm (no spinodal_margin) because we need a genuinely
-        // stable material for a reliable P_ref, unlike the dom_in_unstable
-        // check which uses a wider margin to flag potentially unreliable
-        // pressures.
-        bool m_stable = (rpm <= 0 || rho[m] > rpm);
+        // Use the same spinodal_margin as the dom_in_unstable check:
+        // if dP/drho ≈ 0 makes a pressure unreliable for the dominant,
+        // it is equally unreliable for any candidate reference.
+        bool m_stable = (rpm <= 0 || rho[m] > spinodal_margin * rpm);
         if (m_stable && vfrac[m] > best_vfrac) {
           best_vfrac = vfrac[m];
           ref_mat = m;
