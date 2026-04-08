@@ -1496,6 +1496,15 @@ class PTESolverRhoT
     // Set the current guess for the equilibrium temperature.  Note that this is already
     // scaled.
     Tequil = temp[0];
+
+    // Compute minimum scaled temperature from EOS table bounds (constant
+    // for the lifetime of this solver instance).
+    Tequil_min = 0.0;
+    for (std::size_t m = 0; m < nmat; ++m) {
+      Tequil_min = std::max(Tequil_min,
+                            robust::ratio(eos[m].MinimumTemperature(), Tnorm));
+    }
+
     return ResidualNorm();
   }
 
@@ -1662,14 +1671,8 @@ class PTESolverRhoT
         scale = std::min(robust::ratio(0.5 * (alpha_max - vfrac[m]), mydx), scale);
       }
     }
-    // Compute minimum allowed scaled temperature from EOS table bounds.
-    // Stepping below Tmin causes the EOS to clamp, producing zero derivatives
-    // and triggering cyclic blow-up in the Newton solver.
-    Real Tequil_min = 0.0;
-    for (std::size_t m = 0; m < nmat; ++m) {
-      Tequil_min = std::max(Tequil_min,
-                            robust::ratio(eos[m].MinimumTemperature(), Tnorm));
-    }
+    // Minimum allowed scaled temperature: max of the relative floor (5% of
+    // current T) and the EOS table minimum (precomputed in Init()).
     const Real T_floor = std::max(0.05 * Tequil, Tequil_min);
     if (Tequil + scale * dx[0] < T_floor) {
       if (dx[0] < 0.0 && Tequil > T_floor) {
@@ -1790,9 +1793,17 @@ class PTESolverRhoT
   }
   // === END DEBUG PRINTS ===
 
+  // Returns true when the equilibrium temperature is at or below the
+  // EOS minimum temperature.  Used by the Newton loop to skip futile
+  // pressure jumps when the solver is stuck at the temperature floor.
+  PORTABLE_INLINE_FUNCTION
+  bool IsAtTFloor() const {
+    return Tequil <= Tequil_min * (1.0 + robust::EPS());
+  }
+
  private:
   Real *dpdv, *dedv, *dpdT, *vtemp;
-  Real Tequil, Ttemp;
+  Real Tequil, Ttemp, Tequil_min;
   std::size_t ms;
 };
 
@@ -2043,6 +2054,8 @@ class PTESolverPT
   void DebugPrintState(std::size_t, Real, bool, bool) const {}
   PORTABLE_INLINE_FUNCTION
   void DebugPrintStep(Real) const {}
+  PORTABLE_INLINE_FUNCTION
+  bool IsAtTFloor() const { return false; }
 
  private:
   // TODO(JMM): Should these have trailing underscores?
@@ -2276,6 +2289,8 @@ class PTESolverFixedT
   void DebugPrintState(std::size_t, Real, bool, bool) const {}
   PORTABLE_INLINE_FUNCTION
   void DebugPrintStep(Real) const {}
+  PORTABLE_INLINE_FUNCTION
+  bool IsAtTFloor() const { return false; }
 
  private:
   Real *dpdv, *vtemp;
@@ -2530,6 +2545,8 @@ class PTESolverFixedP
   void DebugPrintState(std::size_t, Real, bool, bool) const {}
   PORTABLE_INLINE_FUNCTION
   void DebugPrintStep(Real) const {}
+  PORTABLE_INLINE_FUNCTION
+  bool IsAtTFloor() const { return false; }
 
  private:
   Real *dpdv, *dpdT, *vtemp;
@@ -2808,6 +2825,8 @@ class PTESolverRhoU
   void DebugPrintState(std::size_t, Real, bool, bool) const {}
   PORTABLE_INLINE_FUNCTION
   void DebugPrintStep(Real) const {}
+  PORTABLE_INLINE_FUNCTION
+  bool IsAtTFloor() const { return false; }
 
  private:
   Real *dpdv, *dtdv, *dpde, *dtde, *vtemp, *utemp;
@@ -2885,8 +2904,11 @@ PORTABLE_INLINE_FUNCTION SolverStatus PTESolver(System &s) {
       // When a material is trapped in a deep negative-pressure region
       // (cold-curve binding well) while others are at positive pressure,
       // bisect to find the P=0 crossing and jump the stuck material there.
+      // Skip if temperature is already at the EOS floor — pressure jumps
+      // cannot help when the solver needs to lower T but can't.
       if (params.pte_pressure_jump_enabled &&
-          status.pressure_jump_attempts < params.pte_pressure_jump_max_attempts) {
+          status.pressure_jump_attempts < params.pte_pressure_jump_max_attempts &&
+          !s.IsAtTFloor()) {
         Real T_phys = s.GetPhysicalT();
 #ifdef PTE_DEBUG_TRACE
         std::printf("[PTESolver] Attempting pressure jump with T_physical=%.6e\n",
@@ -2907,6 +2929,10 @@ PORTABLE_INLINE_FUNCTION SolverStatus PTESolver(System &s) {
           continue;
         }
       }
+#ifdef PTE_DEBUG_TRACE
+      std::printf("[PTESolver] Small-step exit at iter %zu (at_T_floor=%d)\n",
+                  niter, (int)s.IsAtTFloor());
+#endif
       converged = false;
       break;
     }
@@ -2956,7 +2982,8 @@ PORTABLE_INLINE_FUNCTION SolverStatus PTESolver(System &s) {
     // is drifting linearly with no prospect of convergence.
     if (status.stagnation_iters >= params.pte_stagnation_tries && !close_enough) {
       if (params.pte_pressure_jump_enabled &&
-          status.pressure_jump_attempts < params.pte_pressure_jump_max_attempts) {
+          status.pressure_jump_attempts < params.pte_pressure_jump_max_attempts &&
+          !s.IsAtTFloor()) {
 #ifdef PTE_DEBUG_TRACE
         std::printf("[PTESolver] Stagnation detected: %zu iters with err/err_old > %.4f "
                     "at iter %zu (err=%.6e)\n",
@@ -2983,7 +3010,11 @@ PORTABLE_INLINE_FUNCTION SolverStatus PTESolver(System &s) {
         }
         // Jump failed — fall through to fail below
       }
-      // Pressure jumps exhausted or unavailable — no solution reachable.
+      // Pressure jumps exhausted, unavailable, or skipped (T floor).
+#ifdef PTE_DEBUG_TRACE
+      std::printf("[PTESolver] Stagnation exit at iter %zu (at_T_floor=%d)\n",
+                  niter, (int)s.IsAtTFloor());
+#endif
       converged = false;
       break;
     }
