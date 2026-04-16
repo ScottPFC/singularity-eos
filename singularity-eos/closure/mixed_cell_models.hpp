@@ -71,6 +71,23 @@ struct MixParams {
   Real pte_small_step_thresh = 1e-16;
   Real pte_max_dpdv = -1e-8;
 
+  // Pressure-sign-mismatch jump: when some materials have deeply negative
+  // pressure while others are positive, bisect to find the P=0 crossing and
+  // jump the negative-P material to escape the cold-curve binding well.
+  bool pte_pressure_jump_enabled = true;
+  std::size_t pte_pressure_jump_bisect_iters = 20;
+  std::size_t pte_pressure_jump_max_attempts = 3;
+  Real pte_pressure_jump_min_vfrac = 1.0e-8;
+
+  // Stagnation-gated pressure jump: when the error ratio exceeds this
+  // threshold for pte_stagnation_tries consecutive iterations and the
+  // solution is not close_enough, attempt a pressure jump.  This catches
+  // the failure mode where ScaleDx() never returns a tiny value (so
+  // small_step_iters is never incremented) but the solver is stuck in a
+  // linear drift with one material deep in a negative-pressure binding well.
+  Real pte_stagnation_thresh = 0.999;
+  std::size_t pte_stagnation_tries = 10;
+
   // JMM: note the deliberate integer here. Negative value means do
   // the default. Assuming here that we never have a problem with 2^63
   // materials...
@@ -83,6 +100,8 @@ struct SolverStatus {
   std::size_t max_niter = 0;
   std::size_t max_line_niter = 0;
   std::size_t small_step_iters = 0;
+  std::size_t stagnation_iters = 0;
+  std::size_t pressure_jump_attempts = 0;
   Real residual;
 };
 
@@ -304,6 +323,63 @@ class PTESolverBase {
   PORTABLE_INLINE_FUNCTION
   const MixParams &GetParams() const { return params_; }
 
+  // Attempt to escape a cold-curve binding well by jumping materials
+  // across the spinodal to a stable branch.  This fires when the Newton
+  // solver is stuck due to pressure sign mismatches or ill-conditioned
+  // Jacobians near the spinodal boundary.
+  // T_physical is the unscaled equilibrium temperature.
+  //
+  // Three phases (implemented in separate helpers below):
+  //   1. TryVaporJump — jump materials to the vapor-stable branch
+  //   2. TryDenseSideJump — jump materials to the dense-stable branch
+  //   3. NormalizeAndRecomputeAfterJump — fix up vfracs and recompute state
+  PORTABLE_INLINE_FUNCTION
+  bool TryPressureJump(const Real T_physical, const MixParams &params) {
+    const Real min_vfrac = params.pte_pressure_jump_min_vfrac;
+    const Real abs_tol_p = params.pte_abs_tolerance_p;
+    const std::size_t max_bisect = params.pte_pressure_jump_bisect_iters;
+    // Safety factor to keep jump targets off the spinodal boundary.
+    // Multiplying a spinodal density by this factor pushes the result
+    // slightly into the adjacent stable region, avoiding the zone where
+    // dP/drho ≈ 0 and the Jacobian is ill-conditioned.  Used on both
+    // sides: vapor-side (target = spinodal_safety * RhoSpinodalVapor)
+    // and dense-side (bisection upper bound at rho > RhoPmin).
+    constexpr Real spinodal_safety = 0.9;
+
+#ifdef PTE_DEBUG_TRACE
+    std::printf("  [TryPressureJump] T_physical=%.6e  abs_tol_p=%.6e  max_bisect=%zu\n",
+                T_physical, abs_tol_p, max_bisect);
+    for (std::size_t m = 0; m < nmat; ++m) {
+      const Real phys_press = press[m] * uscale;
+      std::printf("    mat[%zu]: press_scaled=%.6e  uscale=%.6e  phys_press=%.6e  "
+                  "rho=%.6e  vfrac=%.6e  rhobar=%.6e\n",
+                  m, press[m], uscale, phys_press, rho[m], vfrac[m], rhobar[m]);
+    }
+#endif
+
+    // Phase 1: Try vapor-side jumps
+    bool any_jumped = TryVaporJump(T_physical, abs_tol_p, max_bisect,
+                                   min_vfrac, spinodal_safety);
+
+    // Phase 2: Dense-side fallback (only if no vapor jumps were made)
+    if (!any_jumped) {
+      any_jumped = TryDenseSideJump(T_physical, max_bisect,
+                                      min_vfrac, spinodal_safety);
+    }
+
+    if (!any_jumped) {
+#ifdef PTE_DEBUG_TRACE
+      std::printf("    => No materials jumped, returning false\n");
+      std::fflush(stdout);
+#endif
+      return false;
+    }
+
+    // Phase 3: Normalize volume fractions and recompute thermodynamic state
+    NormalizeAndRecomputeAfterJump(T_physical);
+    return true;
+  }
+
  protected:
   PORTABLE_INLINE_FUNCTION
   PTESolverBase(std::size_t nmats, std::size_t neqs, const EOSIndexer &eos_,
@@ -342,6 +418,513 @@ class PTESolverBase {
     for (std::size_t m = 0; m < nmat; ++m) {
       vfrac[m] *= robust::ratio(vfrac_total, vfrac_sum);
     }
+  }
+
+  // -----------------------------------------------------------------
+  // Compute a reference pressure (P_ref) from stable materials for
+  // spinodal jump targeting.  Returns the vfrac-weighted average
+  // pressure of materials that are thermodynamically stable:
+  //   - No spinodal (RhoPmin <= 0): EOS has no vapor dome
+  //   - Dense-stable: rho > RhoPmin with positive pressure
+  //   - Vapor-stable: rho <= RhoSpinodalVapor (on the stable vapor branch)
+  // Falls back to the largest-vfrac material's pressure if no
+  // material qualifies as stable.
+  // -----------------------------------------------------------------
+  PORTABLE_INLINE_FUNCTION
+  Real ComputePRef(const Real T_physical) const {
+    Real P_ref_num = 0;
+    Real P_ref_den = 0;
+    for (std::size_t m = 0; m < nmat; ++m) {
+      const Real rpm = eos[m].RhoPmin(T_physical);
+      const Real rho_vapor = eos[m].RhoSpinodalVapor(T_physical);
+      bool m_stable = (rpm <= 0 ||
+                       (rho[m] > rpm && press[m] * uscale > 0) ||
+                       (rho_vapor > 0 && rho[m] <= rho_vapor));
+      if (m_stable) {
+        P_ref_num += vfrac[m] * press[m] * uscale;
+        P_ref_den += vfrac[m];
+      }
+    }
+    if (P_ref_den > 0) {
+      return P_ref_num / P_ref_den;
+    }
+    // Fallback: no material qualifies as stable.  Use the
+    // largest-vfrac material's pressure as a best-effort reference.
+    std::size_t dom = 0;
+    for (std::size_t m = 1; m < nmat; ++m) {
+      if (vfrac[m] > vfrac[dom]) dom = m;
+    }
+    return press[dom] * uscale;
+  }
+
+  // -----------------------------------------------------------------
+  // TryPressureJump helper: vapor-side spinodal jump.
+  //
+  // Handle materials that need to cross the spinodal to the stable
+  // vapor branch.  Three trigger conditions:
+  //   (a) Negative pressure — material is in tension, needs to expand
+  //   (b) Pinned at dense-side spinodal — rho ≈ RhoPmin, solver
+  //       stagnates because dP/drho ≈ 0 at the spinodal boundary
+  //       (ill-conditioned Jacobian).  RhoPmin is a local P minimum,
+  //       so the equilibrium can be at lower rho (in the unstable
+  //       region where P is higher).
+  //   (c) Drifted past spinodal into unstable region — rho < RhoPmin
+  //       but rho > RhoSpinodalVapor.  The ScaleDx escape hatch
+  //       allowed rho to drop below RhoPmin during Newton iteration.
+  //
+  // When the full spinodal crossing is feasible, the target density is
+  // spinodal_safety * RhoSpinodalVapor(T).  When vfrac_hi_max caps
+  // the jump (can't expand enough to cross the spinodal), a P=0
+  // bisection finds the vfrac where the jumped material's pressure
+  // reaches zero.  This is a natural, moderate target — it only
+  // expands the material enough to get out of tension, minimizing
+  // compression of other materials and the energy mismatch that
+  // causes Newton to crash the temperature.
+  //
+  // All materials are checked uniformly; the jump conditions
+  // themselves correctly identify which materials need intervention.
+  //
+  // Jumped materials have their vfrac set negative (sign convention)
+  // so that NormalizeAndRecomputeAfterJump can give them priority.
+  // -----------------------------------------------------------------
+  PORTABLE_INLINE_FUNCTION
+  bool TryVaporJump(const Real T_physical, const Real abs_tol_p,
+                    const std::size_t max_bisect, const Real min_vfrac,
+                    const Real spinodal_safety) {
+    // Margin around RhoPmin for detecting materials pinned at the
+    // dense-side spinodal where dP/drho ~ 0 causes solver stagnation.
+    // A tight margin (5%) ensures we only jump materials that are
+    // genuinely stuck right at the pressure minimum.
+    constexpr Real pinned_margin = 1.05;
+    // Defensive density floor for the P=0 bisection upper bound.
+    // Prevents the bisection from exploring densities where the EOS may
+    // not be well-defined.  In practice vfrac_hi_max almost always binds
+    // first; this only matters when rhobar is extremely small.
+    constexpr Real min_bisection_density = 1.0e-12;
+    // Maximum factor by which non-jumped materials' densities may
+    // increase as a result of the jump.  Limits the jumped material's
+    // vfrac so that other materials keep vfrac >= vfrac_current / cap,
+    // i.e. rho_post <= cap * rho_current.  Prevents the priority
+    // normalization from crushing minority materials into extreme
+    // densities that the solver cannot recover from.
+    constexpr Real density_change_cap = 10.0;
+
+    bool any_jumped = false;
+
+    for (std::size_t m = 0; m < nmat; ++m) {
+      const Real phys_press = press[m] * uscale;
+      const Real rho_pmin = eos[m].RhoPmin(T_physical);
+
+      bool need_vapor_jump = false;
+
+      // Condition (a): negative pressure
+      if (phys_press < -abs_tol_p) {
+        need_vapor_jump = true;
+#ifdef PTE_DEBUG_TRACE
+        std::printf("    mat[%zu]: NEGATIVE P (%.6e), need vapor jump\n", m, phys_press);
+#endif
+      }
+      // Condition (b): pinned at dense-side spinodal (local P minimum).
+      // dP/drho ≈ 0 here, so Newton stagnates.  The equilibrium may be
+      // at lower rho in the unstable region where P rises toward the
+      // vapor-side peak.
+      else if (rho_pmin > 0 && rho[m] >= rho_pmin &&
+               rho[m] <= pinned_margin * rho_pmin) {
+        need_vapor_jump = true;
+#ifdef PTE_DEBUG_TRACE
+        std::printf("    mat[%zu]: PINNED at spinodal (rho=%.6e, RhoPmin=%.6e, "
+                    "P=%.6e), need vapor jump\n",
+                    m, rho[m], rho_pmin, phys_press);
+#endif
+      }
+      // Condition (c): drifted past dense-side spinodal into unstable region.
+      // The ScaleDx escape hatch allowed rho to drop below RhoPmin.
+      // If the material is between the two spinodal edges, jump to the
+      // vapor-side stable branch rather than letting the dense-side
+      // fallback push it back to the dense side.
+      else if (rho_pmin > 0 && rho[m] < rho_pmin) {
+        const Real rho_vapor = eos[m].RhoSpinodalVapor(T_physical);
+        if (rho_vapor > 0 && rho[m] > rho_vapor) {
+          need_vapor_jump = true;
+#ifdef PTE_DEBUG_TRACE
+          std::printf("    mat[%zu]: IN UNSTABLE REGION (rho=%.6e, RhoPmin=%.6e, "
+                      "RhoSpinodalVapor=%.6e, P=%.6e), need vapor jump\n",
+                      m, rho[m], rho_pmin, rho_vapor, phys_press);
+#endif
+        }
+      }
+
+      if (!need_vapor_jump) {
+#ifdef PTE_DEBUG_TRACE
+        std::printf(
+            "    mat[%zu]: rho=%.6e  RhoPmin=%.6e  P=%.6e  no vapor jump needed\n", m,
+            rho[m], rho_pmin, phys_press);
+#endif
+        continue;
+      }
+
+      // Maximum vfrac this material can take without increasing other
+      // materials' densities by more than density_change_cap.
+      Real vfrac_hi_max = vfrac_total;
+      for (std::size_t k = 0; k < nmat; ++k) {
+        if (k == m) continue;
+        vfrac_hi_max -= std::max(min_vfrac, vfrac[k] / density_change_cap);
+      }
+      vfrac_hi_max = std::max(vfrac_hi_max, min_vfrac);
+#ifdef PTE_DEBUG_TRACE
+      std::printf("    mat[%zu]: vfrac_hi_max=%.6e\n", m, vfrac_hi_max);
+#endif
+
+      const Real rho_vapor = eos[m].RhoSpinodalVapor(T_physical);
+      if (rho_vapor > 0) {
+        const Real ideal_vfrac =
+            robust::ratio(rhobar[m], spinodal_safety * rho_vapor);
+        if (ideal_vfrac <= vfrac_hi_max) {
+          // Can cross the spinodal — jump to vapor-stable region
+          vfrac[m] = ideal_vfrac;
+#ifdef PTE_DEBUG_TRACE
+          std::printf("    mat[%zu]: VAPOR JUMP (full) to RhoSpinodalVapor=%.6e "
+                      "(safety*=%.6e), vfrac=%.6e, rho=%.6e\n",
+                      m, rho_vapor, spinodal_safety * rho_vapor, vfrac[m],
+                      robust::ratio(rhobar[m], vfrac[m]));
+#endif
+        } else {
+          // Cannot cross spinodal — vfrac_hi_max caps the jump.
+          // Bisect within [current vfrac, vfrac_hi_max] for P=0: expand
+          // just enough to get out of tension.  This minimizes
+          // compression of non-jumped materials and the energy mismatch.
+          Real lo = vfrac[m];     // current vfrac (high density, P < 0)
+          Real hi = vfrac_hi_max; // max expansion (low density end)
+
+          const Real rho_hi = robust::ratio(rhobar[m], hi);
+          const Real P_hi =
+              eos[m].PressureFromDensityTemperature(rho_hi, T_physical, lambda[m]);
+
+          if (P_hi < 0.0) {
+            // No P=0 crossing in feasible range.  Jump to max only if
+            // it reduces the magnitude of negative pressure.
+            if (std::abs(P_hi) < std::abs(phys_press)) {
+              vfrac[m] = hi;
+#ifdef PTE_DEBUG_TRACE
+              std::printf("    mat[%zu]: VAPOR JUMP (capped, P_hi<0 but improving "
+                          "%.6e -> %.6e), vfrac=%.6e, rho=%.6e\n",
+                          m, phys_press, P_hi, vfrac[m],
+                          robust::ratio(rhobar[m], vfrac[m]));
+#endif
+            } else {
+#ifdef PTE_DEBUG_TRACE
+              std::printf("    mat[%zu]: VAPOR JUMP (capped, P_hi<0 not improving "
+                          "%.6e vs %.6e), skipping\n",
+                          m, phys_press, P_hi);
+#endif
+              continue;
+            }
+          } else {
+            // P_hi >= 0: bisect for P = 0 crossing
+            for (std::size_t iter = 0; iter < max_bisect; ++iter) {
+              const Real mid = 0.5 * (lo + hi);
+              const Real rho_mid = robust::ratio(rhobar[m], mid);
+              const Real P_mid =
+                  eos[m].PressureFromDensityTemperature(rho_mid, T_physical, lambda[m]);
+              if (P_mid < 0.0) {
+                lo = mid;
+              } else {
+                hi = mid;
+              }
+            }
+            vfrac[m] = hi;
+#ifdef PTE_DEBUG_TRACE
+            std::printf("    mat[%zu]: VAPOR JUMP (capped, P=0 bisection) "
+                        "vfrac=%.6e, rho=%.6e\n",
+                        m, vfrac[m], robust::ratio(rhobar[m], vfrac[m]));
+#endif
+          }
+        }
+        any_jumped = true;
+        vfrac[m] = -vfrac[m]; // mark as vapor-jumped for priority normalization
+      } else if (phys_press < -abs_tol_p) {
+        // Fallback: P=0 bisection for materials without pmin_vapor_dome
+        // (no precomputed spinodal curve).
+        const Real lo_init = vfrac[m];
+        Real hi = std::min(vfrac_hi_max, robust::ratio(rhobar[m], min_bisection_density));
+#ifdef PTE_DEBUG_TRACE
+        std::printf("    mat[%zu]: no spinodal curve, fallback P=0 bisection "
+                    "lo=%.6e  hi=%.6e\n",
+                    m, lo_init, hi);
+#endif
+        if (hi <= lo_init) continue;
+
+        const Real rho_hi = robust::ratio(rhobar[m], hi);
+        const Real P_hi =
+            eos[m].PressureFromDensityTemperature(rho_hi, T_physical, lambda[m]);
+        if (P_hi < 0.0) {
+          // No P=0 crossing exists in the feasible range.  Jump anyway
+          // if expanding to maximum feasible density reduces the magnitude
+          // of negative pressure, giving Newton a better starting point.
+          if (std::abs(P_hi) < std::abs(phys_press)) {
+            vfrac[m] = hi;
+            any_jumped = true;
+            vfrac[m] = -vfrac[m]; // mark as vapor-jumped for priority normalization
+#ifdef PTE_DEBUG_TRACE
+            std::printf("    mat[%zu]: P_hi<0 but improving (%.6e -> %.6e), "
+                        "jump to hi=%.6e\n",
+                        m, phys_press, P_hi, hi);
+#endif
+          }
+          continue;
+        }
+
+        // Bisect for P = 0 crossing
+        Real lo = lo_init;
+        for (std::size_t iter = 0; iter < max_bisect; ++iter) {
+          const Real mid = 0.5 * (lo + hi);
+          const Real rho_mid = robust::ratio(rhobar[m], mid);
+          const Real P_mid =
+              eos[m].PressureFromDensityTemperature(rho_mid, T_physical, lambda[m]);
+          if (P_mid < 0.0) {
+            lo = mid;
+          } else {
+            hi = mid;
+          }
+        }
+        vfrac[m] = hi;
+        any_jumped = true;
+        vfrac[m] = -vfrac[m]; // mark as vapor-jumped for priority normalization
+#ifdef PTE_DEBUG_TRACE
+        std::printf("    mat[%zu]: P=0 bisection done: vfrac=%.6e  rho=%.6e\n", m,
+                    -vfrac[m], robust::ratio(rhobar[m], -vfrac[m]));
+#endif
+      }
+      // else: condition (b)/(c) but no spinodal curve — can't jump, skip
+    }
+
+    return any_jumped;
+  }
+
+  // -----------------------------------------------------------------
+  // TryPressureJump helper: dense-side spinodal equilibration.
+  //
+  // No vapor-side jumps were made.  Check for materials on the
+  // unstable side of the spinodal (rho < RhoPmin) and jump them to
+  // the stable (dense) side, targeting P_ref — the vfrac-weighted
+  // average pressure of all stable materials.
+  //
+  // Valid regardless of pressure signs: P_ref is computed from stable
+  // materials only, and the bisection bounds handle out-of-range
+  // targets by clamping to the nearest endpoint on the dense-stable
+  // branch.  Even when P_ref is negative, the jump moves the material
+  // onto a branch where dP/drho > 0 and the Jacobian is well-
+  // conditioned, allowing Newton to make progress.
+  //
+  // Jumped materials keep positive vfrac (no sign convention needed)
+  // since they are being pushed to the dense side, not the vapor side.
+  // -----------------------------------------------------------------
+  PORTABLE_INLINE_FUNCTION
+  bool TryDenseSideJump(const Real T_physical,
+                        const std::size_t max_bisect, const Real min_vfrac,
+                        const Real spinodal_safety) {
+#ifdef PTE_DEBUG_TRACE
+    std::printf("    => Dense-side fallback: spinodal equilibration\n");
+#endif
+
+    const Real P_ref = ComputePRef(T_physical);
+#ifdef PTE_DEBUG_TRACE
+    std::printf("    P_ref=%.6e\n", P_ref);
+#endif
+
+    bool any_jumped = false;
+
+    for (std::size_t m = 0; m < nmat; ++m) {
+      const Real rho_pmin = eos[m].RhoPmin(T_physical);
+#ifdef PTE_DEBUG_TRACE
+      std::printf("    mat[%zu]: rho=%.6e  RhoPmin=%.6e", m, rho[m], rho_pmin);
+#endif
+      if (rho[m] >= rho_pmin) {
+        // On the dense-stable side of the spinodal — Newton can handle this
+#ifdef PTE_DEBUG_TRACE
+        std::printf("  DENSE-STABLE, skipping\n");
+#endif
+        continue;
+      }
+      // Check if material is already on the vapor-stable branch
+      // (past the vapor-side spinodal).  Only push materials back to
+      // the dense side if they are genuinely in the unstable region.
+      // For materials without a vapor spinodal curve (RhoSpinodalVapor
+      // returns 0), we can't determine vapor stability, so we
+      // conservatively proceed with the dense-side jump.
+      {
+        const Real rho_vapor = eos[m].RhoSpinodalVapor(T_physical);
+        if (rho_vapor > 0 && rho[m] <= rho_vapor) {
+#ifdef PTE_DEBUG_TRACE
+          std::printf("  VAPOR-STABLE (rho=%.6e <= RhoSpinodalVapor=%.6e), skipping\n",
+                      rho[m], rho_vapor);
+#endif
+          continue;
+        }
+      }
+#ifdef PTE_DEBUG_TRACE
+      std::printf("  UNSTABLE — need dense-side jump\n");
+#endif
+
+      // Material m is in the unstable region (RhoSpinodalVapor < rho < RhoPmin).
+      // Bisect vfrac on the stable (dense) side to find P = P_ref.
+      const Real rho_max = eos[m].MaximumDensity();
+      Real lo = std::max(min_vfrac, robust::ratio(rhobar[m], rho_max));
+      Real hi = spinodal_safety * robust::ratio(rhobar[m], rho_pmin);
+
+      if (hi <= lo) {
+        vfrac[m] = lo;
+        any_jumped = true;
+#ifdef PTE_DEBUG_TRACE
+        std::printf("    mat[%zu]: degenerate range (hi=%.6e <= lo=%.6e), "
+                    "jumping to vfrac=%.6e (rho_max)\n",
+                    m, hi, lo, lo);
+#endif
+        continue;
+      }
+
+      const Real P_lo = eos[m].PressureFromDensityTemperature(
+          robust::ratio(rhobar[m], lo), T_physical, lambda[m]);
+      const Real P_hi = eos[m].PressureFromDensityTemperature(
+          robust::ratio(rhobar[m], hi), T_physical, lambda[m]);
+
+#ifdef PTE_DEBUG_TRACE
+      std::printf("    mat[%zu]: bisect bounds: lo_vfrac=%.6e (rho=%.6e, P=%.6e)  "
+                  "hi_vfrac=%.6e (rho=%.6e, P=%.6e)  P_ref=%.6e\n",
+                  m, lo, robust::ratio(rhobar[m], lo), P_lo, hi,
+                  robust::ratio(rhobar[m], hi), P_hi, P_ref);
+#endif
+
+      if (P_ref >= P_lo) {
+        vfrac[m] = lo;
+        any_jumped = true;
+#ifdef PTE_DEBUG_TRACE
+        std::printf("    mat[%zu]: P_ref >= P_lo, jumping to max density vfrac=%.6e\n",
+                    m, lo);
+#endif
+        continue;
+      }
+      if (P_ref <= P_hi) {
+        vfrac[m] = hi;
+        any_jumped = true;
+#ifdef PTE_DEBUG_TRACE
+        std::printf("    mat[%zu]: P_ref <= P_hi, jumping to Pmin vfrac=%.6e\n", m, hi);
+#endif
+        continue;
+      }
+
+      // Normal bisection: P(lo) > P_ref > P(hi)
+      for (std::size_t iter = 0; iter < max_bisect; ++iter) {
+        const Real mid = 0.5 * (lo + hi);
+        const Real rho_mid = robust::ratio(rhobar[m], mid);
+        const Real P_mid =
+            eos[m].PressureFromDensityTemperature(rho_mid, T_physical, lambda[m]);
+        if (P_mid > P_ref) {
+          lo = mid;
+        } else {
+          hi = mid;
+        }
+      }
+      vfrac[m] = 0.5 * (lo + hi);
+      any_jumped = true;
+
+#ifdef PTE_DEBUG_TRACE
+      {
+        const Real rho_final = robust::ratio(rhobar[m], vfrac[m]);
+        const Real P_final =
+            eos[m].PressureFromDensityTemperature(rho_final, T_physical, lambda[m]);
+        std::printf("    mat[%zu]: bisection done: vfrac=%.6e  rho=%.6e  P=%.6e\n", m,
+                    vfrac[m], rho_final, P_final);
+      }
+#endif
+    }
+
+    return any_jumped;
+  }
+
+  // -----------------------------------------------------------------
+  // TryPressureJump helper: normalize volume fractions and recompute
+  // thermodynamic state after a pressure jump.
+  //
+  // Priority normalization: vapor-jumped materials (marked with
+  // negative vfrac by TryVaporJump) keep their target vfrac;
+  // non-jumped materials share the remaining volume proportionally.
+  // If only dense-side jumps were made (all vfracs positive), falls
+  // back to simple proportional normalization.
+  //
+  // After normalization, recomputes rho, sie, u, and press for all
+  // materials at the new volume fractions.
+  // -----------------------------------------------------------------
+  PORTABLE_INLINE_FUNCTION
+  void NormalizeAndRecomputeAfterJump(const Real T_physical) {
+    // Renormalize volume fractions so they sum to vfrac_total.
+    bool has_vapor_jumped = false;
+    for (std::size_t m = 0; m < nmat; ++m) {
+      if (vfrac[m] < 0) {
+        has_vapor_jumped = true;
+        break;
+      }
+    }
+    if (has_vapor_jumped) {
+      Real vfrac_jumped_sum = 0;
+      Real vfrac_nonjumped_sum = 0;
+      for (std::size_t m = 0; m < nmat; ++m) {
+        if (vfrac[m] < 0) {
+          vfrac_jumped_sum += (-vfrac[m]);
+        } else {
+          vfrac_nonjumped_sum += vfrac[m];
+        }
+      }
+      Real vfrac_remaining = vfrac_total - vfrac_jumped_sum;
+      if (vfrac_remaining > 0 && vfrac_nonjumped_sum > 0) {
+        Real scale = vfrac_remaining / vfrac_nonjumped_sum;
+#ifdef PTE_DEBUG_TRACE
+        std::printf("    => Priority normalization: jumped_sum=%.6e "
+                    "remaining=%.6e  non-jumped scale=%.6e\n",
+                    vfrac_jumped_sum, vfrac_remaining, scale);
+#endif
+        for (std::size_t m = 0; m < nmat; ++m) {
+          if (vfrac[m] < 0) {
+            vfrac[m] = -vfrac[m]; // restore sign, keep target
+          } else {
+            vfrac[m] *= scale; // fill remaining volume
+          }
+        }
+      } else {
+        // Volume exhaustion fallback: restore signs and use proportional
+#ifdef PTE_DEBUG_TRACE
+        std::printf("    => Priority normalization fallback: jumped_sum=%.6e "
+                    "exceeds vfrac_total=%.6e, using proportional\n",
+                    vfrac_jumped_sum, vfrac_total);
+#endif
+        for (std::size_t m = 0; m < nmat; ++m) {
+          if (vfrac[m] < 0) vfrac[m] = -vfrac[m];
+        }
+        NormalizeVfrac();
+      }
+    } else {
+      NormalizeVfrac();
+    }
+
+    // Recompute state for all materials at the new volume fractions
+    for (std::size_t m = 0; m < nmat; ++m) {
+      rho[m] = robust::ratio(rhobar[m], vfrac[m]);
+      const Real e_m =
+          eos[m].InternalEnergyFromDensityTemperature(rho[m], T_physical, lambda[m]);
+      sie[m] = e_m;
+      u[m] = robust::ratio(rhobar[m] * e_m, uscale);
+      press[m] = robust::ratio(
+          eos[m].PressureFromDensityTemperature(rho[m], T_physical, lambda[m]), uscale);
+    }
+
+#ifdef PTE_DEBUG_TRACE
+    std::printf("    => Post-jump state:\n");
+    for (std::size_t m = 0; m < nmat; ++m) {
+      std::printf("      mat[%zu]: rho=%.6e  vfrac=%.6e  press_phys=%.6e  sie=%.6e\n", m,
+                  rho[m], vfrac[m], press[m] * uscale, sie[m]);
+    }
+    std::fflush(stdout);
+#endif
   }
 
   /* JMM: Find the volume fractions that:
@@ -1119,6 +1702,73 @@ class PTESolverRhoT
     return ResidualNorm();
   }
 
+  PORTABLE_INLINE_FUNCTION
+  Real GetPhysicalT() const { return Tnorm * Tequil; }
+
+  // === DEBUG PRINTS (enabled with -DPTE_DEBUG_TRACE) ===
+  PORTABLE_INLINE_FUNCTION
+  void DebugPrintHeader() const {
+#ifdef PTE_DEBUG_TRACE
+    std::printf("=== PTE SOLVER ITERATION TRACE (PTESolverRhoT) ===\n");
+    std::printf("  nmat=%zu  ms(excluded)=%zu  Tnorm=%.6e  uscale=%.6e\n", nmat, ms,
+                Tnorm, uscale);
+    std::printf("  %-5s %-12s %-12s %-5s %-5s", "iter", "err", "Tequil*Tnorm", "conv",
+                "close");
+    for (std::size_t m = 0; m < nmat; ++m)
+      std::printf("  rho[%zu]       vfrac[%zu]     P[%zu]*uscale  ", m, m, m);
+    std::printf("\n");
+#endif
+  }
+
+  PORTABLE_INLINE_FUNCTION
+  void DebugPrintState(std::size_t iter, Real err, bool converged,
+                       bool close_enough) const {
+#ifdef PTE_DEBUG_TRACE
+    if (iter == 0) DebugPrintHeader();
+    std::printf("  %-5zu %-12.6e %-12.6e %-5d %-5d", iter, err, Tequil * Tnorm,
+                (int)converged, (int)close_enough);
+    for (std::size_t m = 0; m < nmat; ++m)
+      std::printf("  %-12.6e %-12.6e %-12.6e", rho[m], vfrac[m], press[m] * uscale);
+    std::printf("\n");
+    // Print residual vector
+    std::printf("    residual=[");
+    for (std::size_t i = 0; i < neq; ++i)
+      std::printf("%.6e%s", residual[i], i < neq - 1 ? ", " : "");
+    std::printf("]\n");
+    // Print dx (Newton step)
+    std::printf("    dx=[");
+    for (std::size_t i = 0; i < neq; ++i)
+      std::printf("%.6e%s", dx[i], i < neq - 1 ? ", " : "");
+    std::printf("]\n");
+    // Print dpdv and dpdT
+    std::printf("    dpdv=[");
+    for (std::size_t m = 0; m < nmat; ++m)
+      std::printf("%.6e%s", dpdv[m], m < nmat - 1 ? ", " : "");
+    std::printf("]  dpdT=[");
+    for (std::size_t m = 0; m < nmat; ++m)
+      std::printf("%.6e%s", dpdT[m], m < nmat - 1 ? ", " : "");
+    std::printf("]\n");
+    // Print Jacobian matrix
+    std::printf("    Jacobian (%zux%zu):\n", neq, neq);
+    for (std::size_t i = 0; i < neq; ++i) {
+      std::printf("      [");
+      for (std::size_t j = 0; j < neq; ++j)
+        std::printf("%-14.6e", jacobian[i * neq + j]);
+      std::printf("]\n");
+    }
+    std::fflush(stdout);
+#endif
+  }
+
+  PORTABLE_INLINE_FUNCTION
+  void DebugPrintStep(Real scale) const {
+#ifdef PTE_DEBUG_TRACE
+    std::printf("    ScaleDx -> scale=%.6e\n", scale);
+    std::fflush(stdout);
+#endif
+  }
+  // === END DEBUG PRINTS ===
+
  private:
   Real *dpdv, *dedv, *dpdT, *vtemp;
   Real Tequil, Ttemp;
@@ -1364,6 +2014,15 @@ class PTESolverPT
     return ResidualNorm();
   }
 
+  PORTABLE_INLINE_FUNCTION
+  Real GetPhysicalT() const { return Tnorm * Tequil; }
+
+  // No-op debug stubs (only PTESolverRhoT has real prints)
+  PORTABLE_INLINE_FUNCTION
+  void DebugPrintState(std::size_t, Real, bool, bool) const {}
+  PORTABLE_INLINE_FUNCTION
+  void DebugPrintStep(Real) const {}
+
  private:
   // TODO(JMM): Should these have trailing underscores?
   // Current P, T state
@@ -1587,6 +2246,15 @@ class PTESolverFixedT
     Residual();
     return ResidualNorm();
   }
+
+  PORTABLE_INLINE_FUNCTION
+  Real GetPhysicalT() const { return Tnorm * Tequil; }
+
+  // No-op debug stubs (only PTESolverRhoT has real prints)
+  PORTABLE_INLINE_FUNCTION
+  void DebugPrintState(std::size_t, Real, bool, bool) const {}
+  PORTABLE_INLINE_FUNCTION
+  void DebugPrintStep(Real) const {}
 
  private:
   Real *dpdv, *vtemp;
@@ -1832,6 +2500,15 @@ class PTESolverFixedP
     Residual();
     return ResidualNorm();
   }
+
+  PORTABLE_INLINE_FUNCTION
+  Real GetPhysicalT() const { return Tnorm * Tequil; }
+
+  // No-op debug stubs (only PTESolverRhoT has real prints)
+  PORTABLE_INLINE_FUNCTION
+  void DebugPrintState(std::size_t, Real, bool, bool) const {}
+  PORTABLE_INLINE_FUNCTION
+  void DebugPrintStep(Real) const {}
 
  private:
   Real *dpdv, *dpdT, *vtemp;
@@ -2092,6 +2769,25 @@ class PTESolverRhoU
     return ResidualNorm();
   }
 
+  // No-op stub: PTESolverRhoU has per-material temperatures, not a single
+  // equilibrium temperature, so pressure-sign-mismatch jump does not apply.
+  PORTABLE_INLINE_FUNCTION
+  Real GetPhysicalT() const { return 0.0; }
+
+  // PTESolverRhoU has per-material temperatures (not a single equilibrium T),
+  // so the pressure-sign-mismatch jump is not applicable.  Return false to
+  // disable it without special-casing the solver loop.
+  PORTABLE_INLINE_FUNCTION
+  bool TryPressureJump(const Real /*T_physical*/, const MixParams & /*params*/) {
+    return false;
+  }
+
+  // No-op debug stubs (only PTESolverRhoT has real prints)
+  PORTABLE_INLINE_FUNCTION
+  void DebugPrintState(std::size_t, Real, bool, bool) const {}
+  PORTABLE_INLINE_FUNCTION
+  void DebugPrintStep(Real) const {}
+
  private:
   Real *dpdv, *dtdv, *dpde, *dtde, *vtemp, *utemp;
 };
@@ -2125,13 +2821,17 @@ PORTABLE_INLINE_FUNCTION SolverStatus PTESolver(System &s) {
     auto check = s.CheckPTE();
     converged = check.first;
     close_enough = check.second;
-    if (converged) break;
+    if (converged) {
+      s.DebugPrintState(niter, err, converged, close_enough);
+      break;
+    }
 
     // compute the Jacobian
     s.Jacobian();
 
     // solve for the Newton step
     bool success = s.Solve();
+    s.DebugPrintState(niter, err, converged, close_enough);
     if (!success) {
       // do something to crash out?  Tell folks what happened?
       // printf("crashing out at iteration: %ld\n", niter);
@@ -2141,6 +2841,7 @@ PORTABLE_INLINE_FUNCTION SolverStatus PTESolver(System &s) {
 
     // possibly scale the update to stay within reasonable bounds
     Real scale = std::min(1.0, s.ScaleDx());
+    s.DebugPrintStep(scale);
     PORTABLE_REQUIRE(scale <= 1.0, "PTE Solver is attempting to increase the step size");
 
     // If scale is very small, we may be iterating around the regime
@@ -2150,7 +2851,41 @@ PORTABLE_INLINE_FUNCTION SolverStatus PTESolver(System &s) {
     // iterations, in case we can escape.
     if (std::abs(scale) < params.pte_small_step_thresh) small_step_iters++;
     if (small_step_iters >= params.pte_small_step_tries) {
-      // printf("Failing out because scale is too small\n");
+#ifdef PTE_DEBUG_TRACE
+      std::printf(
+          "[PTESolver] small_step_iters=%zu >= pte_small_step_tries=%zu at iter %zu\n",
+          small_step_iters, params.pte_small_step_tries, niter);
+      std::printf(
+          "[PTESolver] pressure_jump_enabled=%d  attempts=%zu  max_attempts=%zu\n",
+          (int)params.pte_pressure_jump_enabled, status.pressure_jump_attempts,
+          params.pte_pressure_jump_max_attempts);
+#endif
+      // Attempt pressure-sign-mismatch jump before failing out.
+      // When a material is trapped in a deep negative-pressure region
+      // (cold-curve binding well) while others are at positive pressure,
+      // bisect to find the P=0 crossing and jump the stuck material there.
+      if (params.pte_pressure_jump_enabled &&
+          status.pressure_jump_attempts < params.pte_pressure_jump_max_attempts) {
+        Real T_phys = s.GetPhysicalT();
+#ifdef PTE_DEBUG_TRACE
+        std::printf("[PTESolver] Attempting pressure jump with T_physical=%.6e\n",
+                    T_phys);
+#endif
+        bool jumped = s.TryPressureJump(T_phys, params);
+        status.pressure_jump_attempts++;
+#ifdef PTE_DEBUG_TRACE
+        std::printf("[PTESolver] TryPressureJump returned jumped=%d\n", (int)jumped);
+#endif
+        if (jumped) {
+          small_step_iters = 0;
+          s.Fixup();
+          err = s.TestUpdate(0.0, true);
+#ifdef PTE_DEBUG_TRACE
+          std::printf("[PTESolver] Post-jump err=%.6e\n", err);
+#endif
+          continue;
+        }
+      }
       converged = false;
       break;
     }
@@ -2183,6 +2918,54 @@ PORTABLE_INLINE_FUNCTION SolverStatus PTESolver(System &s) {
 
     // apply fixes post update, e.g. renormalize volume fractions to deal with round-off
     s.Fixup();
+
+    // Track stagnation: consecutive iterations with negligible error reduction.
+    // When the solver is stuck in a linear drift (e.g. one material deep in a
+    // negative-pressure binding well while others are at positive pressure),
+    // the error ratio err/err_old is very close to 1.0 for many iterations.
+    if (err > params.pte_stagnation_thresh * err_old) {
+      status.stagnation_iters++;
+    } else {
+      status.stagnation_iters = 0;
+    }
+
+    // If stagnating and NOT close_enough, attempt a pressure-sign-mismatch
+    // jump.  This catches the failure mode where ScaleDx() never returns a
+    // tiny value (so small_step_iters is never incremented) but the solver
+    // is drifting linearly with no prospect of convergence.
+    if (status.stagnation_iters >= params.pte_stagnation_tries && !close_enough) {
+      if (params.pte_pressure_jump_enabled &&
+          status.pressure_jump_attempts < params.pte_pressure_jump_max_attempts) {
+#ifdef PTE_DEBUG_TRACE
+        std::printf("[PTESolver] Stagnation detected: %zu iters with err/err_old > %.4f "
+                    "at iter %zu (err=%.6e)\n",
+                    status.stagnation_iters, params.pte_stagnation_thresh, niter, err);
+#endif
+        Real T_phys = s.GetPhysicalT();
+#ifdef PTE_DEBUG_TRACE
+        std::printf("[PTESolver] Attempting pressure jump with T_physical=%.6e\n",
+                    T_phys);
+#endif
+        bool jumped = s.TryPressureJump(T_phys, params);
+        status.pressure_jump_attempts++;
+#ifdef PTE_DEBUG_TRACE
+        std::printf("[PTESolver] TryPressureJump returned jumped=%d\n", (int)jumped);
+#endif
+        if (jumped) {
+          status.stagnation_iters = 0;
+          s.Fixup();
+          err = s.TestUpdate(0.0, true);
+#ifdef PTE_DEBUG_TRACE
+          std::printf("[PTESolver] Post-jump err=%.6e\n", err);
+#endif
+          continue;
+        }
+        // Jump failed — fall through to fail below
+      }
+      // Pressure jumps exhausted or unavailable — no solution reachable.
+      converged = false;
+      break;
+    }
 
     // check for the case where the solver is no longer moving towards
     // a descent direction sufficiently rapidly, but we believe we

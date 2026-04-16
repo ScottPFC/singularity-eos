@@ -808,6 +808,9 @@ class EosBase {
   PORTABLE_INLINE_FUNCTION
   Real RhoPmin(const Real temp) const { return 0.0; }
 
+  PORTABLE_INLINE_FUNCTION
+  Real RhoSpinodalVapor(const Real temp) const { return 0.0; }
+
   static inline unsigned long scratch_size(const std::string method,
                                            const unsigned int nelements) {
     return 0;
