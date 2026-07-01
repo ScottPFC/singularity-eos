@@ -31,6 +31,7 @@
 #include <singularity-eos/eos/eos_spiner.hpp>
 #include <singularity-eos/eos/eos_stellar_collapse.hpp>
 #include <singularity-eos/eos/eos_stiff.hpp>
+#include <singularity-eos/eos/eos_table_pt.hpp>
 #include <singularity-eos/eos/eos_vinet.hpp>
 // Modifiers
 #include <singularity-eos/eos/modifiers/eos_unitsystem.hpp>

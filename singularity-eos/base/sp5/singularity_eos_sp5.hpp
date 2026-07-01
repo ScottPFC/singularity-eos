@@ -25,6 +25,8 @@ constexpr char logType[] = "log_type";
 namespace Depends {
 constexpr char logRhoLogSie[] = "dependsLogRhoLogSie";
 constexpr char logRhoLogT[] = "dependsLogRhoLogT";
+// Inverted (P,T) table for the PTE closure (TableDependsPT); raw native (P,T) node grid.
+constexpr char logPLogT[] = "dependsLogPLogT";
 constexpr char coldCurve[] = "coldCurve";
 constexpr char massFrac[] = "massFrac";
 } // namespace Depends
@@ -67,6 +69,13 @@ constexpr char dTdRho[] = "dTdRho";
 constexpr char dTdE[] = "dTdE";
 constexpr char dEdRho[] = "dEdRho";
 constexpr char dEdT[] = "dEdT";
+// Inverted (P,T)-table fields (dependsLogPLogT group, TableDependsPT). `dEdT_P` is
+// (de/dT)_P — distinct from `dEdT` above (at constant rho) to avoid a collision.
+constexpr char rho[] = "density";
+constexpr char dRhodP[] = "dRhodP";
+constexpr char dRhodT[] = "dRhodT";
+constexpr char dEdP[] = "dEdP";
+constexpr char dEdT_P[] = "dEdT_P";
 constexpr char mask[] = "mask";
 constexpr char transitionMask[] = "transition mask";
 constexpr char massFrac[] = "mass fractions";
