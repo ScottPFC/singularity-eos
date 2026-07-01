@@ -2142,6 +2142,199 @@ class PTESolverPTAnalytic
 };
 
 // ======================================================================
+// Cyclic P-T solver (Clayton-McConnell-Solomon Alg 5.2) -- PRIMARY PTE method
+// ======================================================================
+// The cyclic method is NOT a 2x2 Newton (that is PTESolverPT): each iteration takes a
+// 1-D Newton step in P on the density residual varrho = 1/tau - 1/tau0, a 1-D Newton step
+// in T on the enthalpy residual h (d_T h = c_p > 0), then intersects the tau-level-set
+// tangent (slope (dP/dT)_varrho) with the isentrope tangent (slope (dT/dP)_s) for the next
+// (P,T). It converges from far seeds where the 2-D Newton fails (Theorem 5.2), given a
+// thermodynamically admissible mixture (each EOS MP-stable -> unique root, Theorem 2.26).
+// It therefore uses a dedicated loop (PTESolverPTCyclicSolve) instead of the generic
+// PTESolver Newton+line-search driver (the cyclic step is not a descent direction on the
+// residual norm, so a line search would fight it). Ports pfc _pte.py::_cyclic_step exactly.
+// Requires an EOS providing DensityEnergyDerivativesFromPressureTemperature (TableDependsPT).
+template <typename EOSIndexer, typename RealIndexer, typename LambdaIndexer>
+class PTESolverPTCyclic
+    : public PTESolverPT<EOSIndexer, RealIndexer, LambdaIndexer> {
+  using Base = PTESolverPT<EOSIndexer, RealIndexer, LambdaIndexer>;
+  using Base::eos;
+  using Base::lambda;
+  using Base::nmat;
+  using Base::Pequil;
+  using Base::press;
+  using Base::rho;
+  using Base::rho_total;
+  using Base::rhobar;
+  using Base::sie;
+  using Base::sie_total;
+  using Base::temp;
+  using Base::Tequil;
+  using Base::Tnorm;
+  using Base::u;
+  using Base::uscale;
+  using Base::vfrac;
+
+  struct Mix {
+    Real tau, e, dtau_dp, dtau_dt, de_dp, de_dt;
+  };
+
+  // Mass-fraction-weighted mixture tau, e and (P,T) partials at physical (P,T).
+  PORTABLE_INLINE_FUNCTION Mix mixture_(const Real P, const Real T) const {
+    Mix mx{0., 0., 0., 0., 0., 0.};
+    for (std::size_t m = 0; m < nmat; ++m) {
+      Real rho_m, sie_m, drho_dP, drho_dT, de_dP, de_dT;
+      eos[m].DensityEnergyDerivativesFromPressureTemperature(
+          P, T, lambda[m], rho_m, sie_m, drho_dP, drho_dT, de_dP, de_dT);
+      const Real Y = robust::ratio(rhobar[m], rho_total);
+      const Real tau_m = robust::ratio(1.0, rho_m);
+      const Real inv_rho2 = robust::ratio(1.0, rho_m * rho_m);
+      mx.tau += Y * tau_m;
+      mx.e += Y * sie_m;
+      mx.dtau_dp += Y * (-drho_dP * inv_rho2); // dtau/dP = -(drho/dP)/rho^2
+      mx.dtau_dt += Y * (-drho_dT * inv_rho2);
+      mx.de_dp += Y * de_dP;
+      mx.de_dt += Y * de_dT;
+    }
+    return mx;
+  }
+
+  // Intersect line A: P = pA + a (T - tA) with line B: T = tB + b (P - pB).
+  PORTABLE_INLINE_FUNCTION bool intersect_(const Real pA, const Real tA, const Real a,
+                                           const Real pB, const Real tB, const Real b,
+                                           Real &P, Real &T) const {
+    const Real ab = a * b;
+    if (std::abs(1.0 - ab) < 1.0e-300 || !std::isfinite(ab)) return false;
+    T = (tB + b * (pA - pB) - ab * tA) / (1.0 - ab);
+    P = pA + a * (T - tA);
+    return std::isfinite(P) && std::isfinite(T);
+  }
+
+ public:
+  template <typename EOS_t, typename Real_t, typename Lambda_t>
+  PORTABLE_INLINE_FUNCTION
+  PTESolverPTCyclic(const std::size_t nmat, EOS_t &&eos, const Real vfrac_tot,
+                    const Real sie_tot, Real_t &&rho, Real_t &&vfrac, Real_t &&sie,
+                    Real_t &&temp, Real_t &&press, Lambda_t &&lambda, Real *scratch,
+                    const Real Tnorm = 0.0, const MixParams &params = MixParams())
+      : Base(nmat, std::forward<EOS_t>(eos), vfrac_tot, sie_tot, std::forward<Real_t>(rho),
+             std::forward<Real_t>(vfrac), std::forward<Real_t>(sie),
+             std::forward<Real_t>(temp), std::forward<Real_t>(press),
+             std::forward<Lambda_t>(lambda), scratch, Tnorm, params) {}
+
+  static inline std::string MethodType() { return std::string("PTESolverPTCyclic"); }
+
+  // One cyclic iteration: update (Pequil, Tequil), re-evaluate per-material state and the
+  // mixture residual. Returns the new residual norm. (Ports _pte.py::_cyclic_step.)
+  PORTABLE_INLINE_FUNCTION
+  Real CyclicStep() {
+    const Real tau0 = robust::ratio(1.0, rho_total); // mixture specific volume target
+    const Real e0 = sie_total;
+    const Real P = Pequil * uscale, T = Tequil * Tnorm; // physical
+    const Mix mix = mixture_(P, T);
+
+    // Step 1: Newton step in P on the density residual varrho = 1/tau - 1/tau0.
+    const Real varrho = robust::ratio(1.0, mix.tau) - robust::ratio(1.0, tau0);
+    const Real dvarrho_dp = -mix.dtau_dp / (mix.tau * mix.tau);
+    Real p_tilde = (dvarrho_dp == 0.0) ? P : P - varrho / dvarrho_dp;
+
+    // Step 2: Newton step in T on the enthalpy residual h at (p_tilde, T); d_T h = c_p.
+    const Mix mix_p = mixture_(p_tilde, T);
+    const Real enth = (mix_p.e + p_tilde * mix_p.tau) - (e0 + p_tilde * tau0);
+    const Real c_p = mix_p.de_dt + p_tilde * mix_p.dtau_dt;
+    const Real t_tilde = (c_p == 0.0) ? T : T - enth / c_p;
+
+    // Step 3: intersect the tau-level-set tangent at (p_tilde, T) with the isentrope
+    // tangent at (p_tilde, t_tilde); fall back to the enthalpy-curve tangent.
+    const Real slope_a =
+        (mix_p.dtau_dp == 0.0) ? 0.0 : -mix_p.dtau_dt / mix_p.dtau_dp; // (dP/dT)_varrho
+    const Mix mix_pt = mixture_(p_tilde, t_tilde);
+    const Real c_p_pt = mix_pt.de_dt + p_tilde * mix_pt.dtau_dt;
+    const Real slope_b_s =
+        (c_p_pt == 0.0) ? 0.0 : t_tilde * mix_pt.dtau_dt / c_p_pt; // (dT/dP)_s
+    Real Pn, Tn;
+    bool ok = intersect_(p_tilde, T, slope_a, p_tilde, t_tilde, slope_b_s, Pn, Tn);
+    if (!ok || !InBox_(Pn, Tn)) {
+      const Real slope_b_h =
+          (c_p_pt == 0.0) ? 0.0 : (t_tilde * mix_pt.dtau_dt - mix_pt.tau) / c_p_pt;
+      Real Pa, Ta;
+      if (intersect_(p_tilde, T, slope_a, p_tilde, t_tilde, slope_b_h, Pa, Ta)) {
+        Pn = Pa;
+        Tn = Ta;
+        ok = true;
+      }
+    }
+    if (!ok) {
+      Pn = p_tilde;
+      Tn = t_tilde;
+    }
+    ClampToBox_(Pn, Tn);
+
+    // Commit the new state (physical -> scaled) and refresh per-material quantities.
+    Pequil = robust::ratio(Pn, uscale);
+    Tequil = robust::ratio(Tn, Tnorm);
+    for (std::size_t m = 0; m < nmat; ++m) {
+      eos[m].DensityEnergyFromPressureTemperature(Pn, Tn, lambda[m], rho[m], sie[m]);
+      vfrac[m] = robust::ratio(rhobar[m], rho[m]);
+      u[m] = robust::ratio(sie[m] * rhobar[m], uscale);
+      temp[m] = Tequil;
+      press[m] = Pequil;
+    }
+    this->Residual();
+    return this->ResidualNorm();
+  }
+
+  // Aggregate EOS-domain box over all materials (tightest common (P,T) rectangle).
+  PORTABLE_INLINE_FUNCTION void Box_(Real &Plo, Real &Phi, Real &Tlo, Real &Thi,
+                                     const Real Tref) const {
+    Plo = eos[0].MinimumPressure();
+    Phi = eos[0].MaximumPressureAtTemperature(Tref);
+    Tlo = eos[0].MinimumTemperature();
+    Thi = eos[0].MaximumTemperature();
+    for (std::size_t m = 1; m < nmat; ++m) {
+      Plo = std::max(Plo, eos[m].MinimumPressure());
+      Phi = std::min(Phi, eos[m].MaximumPressureAtTemperature(Tref));
+      Tlo = std::max(Tlo, eos[m].MinimumTemperature());
+      Thi = std::min(Thi, eos[m].MaximumTemperature());
+    }
+  }
+  PORTABLE_INLINE_FUNCTION bool InBox_(const Real P, const Real T) const {
+    Real Plo, Phi, Tlo, Thi;
+    Box_(Plo, Phi, Tlo, Thi, T);
+    return P >= Plo && P <= Phi && T >= Tlo && T <= Thi;
+  }
+  PORTABLE_INLINE_FUNCTION void ClampToBox_(Real &P, Real &T) const {
+    Real Plo, Phi, Tlo, Thi;
+    Box_(Plo, Phi, Tlo, Thi, T);
+    P = std::min(std::max(P, Plo), Phi);
+    T = std::min(std::max(T, Tlo), Thi);
+  }
+};
+
+// Dedicated driver for the cyclic P-T solver: iterate the cyclic step to convergence.
+// (Mirrors pfc _pte.py::solve_pte; distinct from the Newton PTESolver above because the
+// cyclic step is not a line-search descent direction.)
+template <class System>
+PORTABLE_INLINE_FUNCTION SolverStatus PTESolverPTCyclicSolve(System &s) {
+  SolverStatus status;
+  Real &err = status.residual;
+  err = s.Init();
+  const MixParams &params = s.GetParams();
+  auto &niter = s.Niter();
+  const std::size_t pte_max_iter = s.Nmat() * params.pte_max_iter_per_mat;
+  status.converged = false;
+  for (niter = 0; niter < pte_max_iter; ++niter) {
+    status.max_niter = std::max(status.max_niter, niter);
+    auto check = s.CheckPTE();
+    status.converged = check.first;
+    if (status.converged) break;
+    err = s.CyclicStep();
+  }
+  s.Finalize();
+  return status;
+}
+
+// ======================================================================
 // fixed temperature solver
 // ======================================================================
 constexpr inline std::size_t PTESolverFixedTRequiredScratch(const std::size_t nmat) {
