@@ -2161,6 +2161,7 @@ class PTESolverPTCyclic
   using Base::eos;
   using Base::lambda;
   using Base::nmat;
+  using Base::params_;
   using Base::Pequil;
   using Base::press;
   using Base::rho;
@@ -2290,12 +2291,13 @@ class PTESolverPTCyclic
     Plo = eos[0].MinimumPressure();
     Phi = eos[0].MaximumPressureAtTemperature(Tref);
     Tlo = eos[0].MinimumTemperature();
-    Thi = eos[0].MaximumTemperature();
+    // Upper T bound: the solver's temperature_limit (the EOS variant does not forward a
+    // MaximumTemperature accessor; the lower T/P bounds are what guard the failure modes).
+    Thi = params_.temperature_limit;
     for (std::size_t m = 1; m < nmat; ++m) {
       Plo = std::max(Plo, eos[m].MinimumPressure());
       Phi = std::min(Phi, eos[m].MaximumPressureAtTemperature(Tref));
       Tlo = std::max(Tlo, eos[m].MinimumTemperature());
-      Thi = std::min(Thi, eos[m].MaximumTemperature());
     }
   }
   PORTABLE_INLINE_FUNCTION bool InBox_(const Real P, const Real T) const {
