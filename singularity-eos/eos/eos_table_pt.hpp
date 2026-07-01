@@ -119,6 +119,16 @@ class TableDependsPT : public EosBase<TableDependsPT> {
   DensityEnergyFromPressureTemperature(const Real press, const Real temp,
                                        Indexer_t &&lambda, Real &rho, Real &sie) const;
 
+  // (P,T) -> (rho, e) plus the four first partials of *this interpolant* (drho/dP)_T,
+  // (drho/dT)_P, (de/dP)_T, (de/dT)_P. These are the exact analytic derivatives of
+  // DensityEnergyFromPressureTemperature above, so PTESolverPTAnalytic's Jacobian is
+  // consistent with the residual it drives (vs. the base PTESolverPT finite-difference).
+  // (This is the partial set the validated pfc solver used: _pte_table.py::evaluate.)
+  template <typename Indexer_t = Real *>
+  PORTABLE_INLINE_FUNCTION void DensityEnergyDerivativesFromPressureTemperature(
+      const Real press, const Real temp, Indexer_t &&lambda, Real &rho, Real &sie,
+      Real &drho_dP, Real &drho_dT, Real &de_dP, Real &de_dT) const;
+
   // ---- (rho,T) / (rho,e) entry points (invert the monotone rho(P) at fixed T) ----
   template <typename Indexer_t = Real *>
   PORTABLE_INLINE_FUNCTION Real InternalEnergyFromDensityTemperature(
@@ -383,6 +393,37 @@ PORTABLE_INLINE_FUNCTION void TableDependsPT::DensityEnergyFromPressureTemperatu
   const Real tau = (1.0 - w) * tau_j + w * tau_jp;
   rho = 1.0 / tau;
   sie = (1.0 - w) * e_j + w * e_jp;
+}
+
+template <typename Indexer_t>
+PORTABLE_INLINE_FUNCTION void
+TableDependsPT::DensityEnergyDerivativesFromPressureTemperature(
+    const Real press, const Real temp, Indexer_t &&, Real &rho, Real &sie, Real &drho_dP,
+    Real &drho_dT, Real &de_dP, Real &de_dT) const {
+  const Real p = std::min(std::max(press, Pmin_), Pmax_);
+  const Real t = std::min(std::max(temp, Tmin_), Tmax_);
+  const int i = cell_(P_, numP_, p);
+  const int j = cell_(T_, numT_, t);
+  const Real p_i = P_(i), p_ip = P_(i + 1);
+  const Real t_j = T_(j), t_jp = T_(j + 1);
+
+  Real tau_j, dtau_dp_j, e_j, de_dp_j;
+  Real tau_jp, dtau_dp_jp, e_jp, de_dp_jp;
+  column_(i, j, p_i, p_ip, p, tau_j, dtau_dp_j, e_j, de_dp_j);
+  column_(i, j + 1, p_i, p_ip, p, tau_jp, dtau_dp_jp, e_jp, de_dp_jp);
+
+  const Real dt = t_jp - t_j;
+  const Real w = (t - t_j) / dt;
+  const Real tau = (1.0 - w) * tau_j + w * tau_jp;
+  rho = 1.0 / tau;
+  sie = (1.0 - w) * e_j + w * e_jp;
+  // Blend the P-line partials in T; T-partials are the secant slopes (linear in T).
+  const Real dtau_dP = (1.0 - w) * dtau_dp_j + w * dtau_dp_jp;
+  const Real dtau_dT = (tau_jp - tau_j) / dt;
+  drho_dP = -dtau_dP / (tau * tau); // rho = 1/tau => drho = -dtau/tau^2
+  drho_dT = -dtau_dT / (tau * tau);
+  de_dP = (1.0 - w) * de_dp_j + w * de_dp_jp;
+  de_dT = (e_jp - e_j) / dt;
 }
 
 template <typename Indexer_t>

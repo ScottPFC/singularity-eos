@@ -1822,6 +1822,9 @@ constexpr inline size_t PTESolverPTRequiredScratchInBytes(const std::size_t nmat
 template <typename EOSIndexer, typename RealIndexer, typename LambdaIndexer>
 class PTESolverPT
     : public mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer> {
+  // protected (not private) so subclasses (PTESolverPTAnalytic) inherit these base-member
+  // handles and can override Jacobian()/etc.
+ protected:
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::InitBase;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::AssignIncrement;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::nmat;
@@ -2057,15 +2060,85 @@ class PTESolverPT
   PORTABLE_INLINE_FUNCTION
   bool IsAtTFloor() const { return false; }
 
- private:
+ protected:
   // TODO(JMM): Should these have trailing underscores?
-  // Current P, T state
+  // Current P, T state. Protected (not private) so PTESolverPTAnalytic can override
+  // Jacobian() using the equilibrium (P,T) directly.
   Real Pequil;
   Real Tequil;
   // Scratch states for test update
   Real Ptemp;
   Real Ttemp;
   // TODO(JMM): Should there be a P norm as well as a Tnorm?
+};
+
+// ======================================================================
+// P-T solver with an ANALYTIC Jacobian (fast path / fallback for the cyclic solver)
+// ======================================================================
+// Identical to PTESolverPT except Jacobian() uses the EOS's exact (P,T) partials
+// (DensityEnergyDerivativesFromPressureTemperature, e.g. TableDependsPT) instead of a
+// finite difference. Because those partials are the exact derivatives of the same
+// DensityEnergyFromPressureTemperature the residual is built from, the Newton step is
+// consistent, and we avoid the base solver's FD stencil that deliberately perturbs P
+// toward a phase transition (a source of noise near transitions). Requires an EOS that
+// provides the derivatives method; use only on (P,T)-table mixtures (TableDependsPT).
+template <typename EOSIndexer, typename RealIndexer, typename LambdaIndexer>
+class PTESolverPTAnalytic
+    : public PTESolverPT<EOSIndexer, RealIndexer, LambdaIndexer> {
+  using Base = PTESolverPT<EOSIndexer, RealIndexer, LambdaIndexer>;
+  // Base-member handles (nmat, eos, rho, rhobar, uscale, Tnorm, lambda, jacobian,
+  // Pequil, Tequil) are inherited protected from PTESolverPT / PTESolverBase.
+  using Base::eos;
+  using Base::jacobian;
+  using Base::lambda;
+  using Base::nmat;
+  using Base::Pequil;
+  using Base::rho;
+  using Base::rhobar;
+  using Base::Tequil;
+  using Base::Tnorm;
+  using Base::uscale;
+
+ public:
+  template <typename EOS_t, typename Real_t, typename Lambda_t>
+  PORTABLE_INLINE_FUNCTION
+  PTESolverPTAnalytic(const std::size_t nmat, EOS_t &&eos, const Real vfrac_tot,
+                      const Real sie_tot, Real_t &&rho, Real_t &&vfrac, Real_t &&sie,
+                      Real_t &&temp, Real_t &&press, Lambda_t &&lambda, Real *scratch,
+                      const Real Tnorm = 0.0, const MixParams &params = MixParams())
+      : Base(nmat, std::forward<EOS_t>(eos), vfrac_tot, sie_tot, std::forward<Real_t>(rho),
+             std::forward<Real_t>(vfrac), std::forward<Real_t>(sie),
+             std::forward<Real_t>(temp), std::forward<Real_t>(press),
+             std::forward<Lambda_t>(lambda), scratch, Tnorm, params) {}
+
+  static inline std::string MethodType() { return std::string("PTESolverPTAnalytic"); }
+
+  PORTABLE_INLINE_FUNCTION
+  void Jacobian() const {
+    Real dudT_P_sum = 0.0, dudP_T_sum = 0.0;
+    Real rbor2_dr_dT_P_sum = 0.0, rbor2_dr_dP_T_sum = 0.0;
+    for (std::size_t m = 0; m < nmat; ++m) {
+      Real r, e, drho_dP, drho_dT, de_dP, de_dT;
+      eos[m].DensityEnergyDerivativesFromPressureTemperature(
+          uscale * Pequil, Tnorm * Tequil, lambda[m], r, e, drho_dP, drho_dT, de_dP, de_dT);
+      // Rescale to the solver's nondimensional (Pequil, Tequil) variables, matching the
+      // finite-difference convention in PTESolverPT::Jacobian: physical P = uscale*Pequil,
+      // physical T = Tnorm*Tequil, and u_m = rhobar_m * sie_m / uscale.
+      const Real drdp = drho_dP * uscale;                 // d rho_m / dPequil
+      const Real drdT = drho_dT * Tnorm;                  // d rho_m / dTequil
+      const Real dudp = rhobar[m] * de_dP;                // d u_m / dPequil
+      const Real dudT = rhobar[m] * (Tnorm / uscale) * de_dT; // d u_m / dTequil
+      const Real rbor2 = robust::ratio(rhobar[m], rho[m] * rho[m]);
+      rbor2_dr_dP_T_sum += rbor2 * drdp;
+      rbor2_dr_dT_P_sum += rbor2 * drdT;
+      dudP_T_sum += dudp;
+      dudT_P_sum += dudT;
+    }
+    jacobian[0] = -rbor2_dr_dT_P_sum;
+    jacobian[1] = -rbor2_dr_dP_T_sum;
+    jacobian[2] = dudT_P_sum;
+    jacobian[3] = dudP_T_sum;
+  }
 };
 
 // ======================================================================
