@@ -175,12 +175,61 @@ class TableDependsPT : public EosBase<TableDependsPT> {
     PORTABLE_ALWAYS_THROW_OR_ABORT("Gruneisen not implemented for TableDependsPT");
     return 0.0;
   }
+  // (rho, sie) aux variants (each model must provide the scalar; EosBase only supplies the
+  // vector overloads that delegate here). Entropy/Gruneisen fail loudly; bulk modulus goes
+  // through the T inversion.
+  template <typename Indexer_t = Real *>
+  PORTABLE_INLINE_FUNCTION Real
+  EntropyFromDensityInternalEnergy(const Real, const Real,
+                                   Indexer_t && = static_cast<Real *>(nullptr)) const {
+    PORTABLE_ALWAYS_THROW_OR_ABORT("Entropy not implemented for TableDependsPT");
+    return 0.0;
+  }
+  template <typename Indexer_t = Real *>
+  PORTABLE_INLINE_FUNCTION Real BulkModulusFromDensityInternalEnergy(
+      const Real rho, const Real sie,
+      Indexer_t &&lambda = static_cast<Real *>(nullptr)) const {
+    return BulkModulusFromDensityTemperature(
+        rho, TemperatureFromDensityInternalEnergy(rho, sie, lambda), lambda);
+  }
+  template <typename Indexer_t = Real *>
+  PORTABLE_INLINE_FUNCTION Real
+  GruneisenParamFromDensityInternalEnergy(const Real, const Real,
+                                          Indexer_t && = static_cast<Real *>(nullptr)) const {
+    PORTABLE_ALWAYS_THROW_OR_ABORT("Gruneisen not implemented for TableDependsPT");
+    return 0.0;
+  }
 
   template <typename Indexer_t = Real *>
   PORTABLE_INLINE_FUNCTION void
   FillEos(Real &rho, Real &temp, Real &energy, Real &press, Real &cv, Real &bmod,
           const unsigned long output,
           Indexer_t &&lambda = static_cast<Real *>(nullptr)) const;
+
+  // Reference state (~room T at the material's normal density) used by the C API / FLASH
+  // for normalization + initial guesses. Derived from the table at (P_ref, T_ref).
+  template <typename Indexer_t = Real *>
+  PORTABLE_INLINE_FUNCTION void
+  ValuesAtReferenceState(Real &rho, Real &temp, Real &sie, Real &press, Real &cv, Real &bmod,
+                         Real &dpde, Real &dvdt,
+                         Indexer_t &&lambda = static_cast<Real *>(nullptr)) const {
+    const Real T_ref = std::min(std::max(298.15, Tmin_), Tmax_);
+    const Real rho_ref =
+        (normalDensity_ > 0.0) ? normalDensity_ : std::sqrt(rhoMin_ * rhoMax_);
+    const Real P_ref = pressureOfRhoT_(rho_ref, T_ref);
+    Real r, e, drho_dP, drho_dT, de_dP, de_dT;
+    DensityEnergyDerivativesFromPressureTemperature(P_ref, T_ref, lambda, r, e, drho_dP,
+                                                    drho_dT, de_dP, de_dT);
+    rho = r;
+    temp = T_ref;
+    sie = e;
+    press = P_ref;
+    cv = de_dT;                                // heat-capacity scale (>0 in single phase)
+    bmod = r / robust::make_positive(drho_dP); // isothermal bulk modulus K_T
+    // (dP/de)_rho ~ (dP/dT)_rho / (de/dT)_rho, with (dP/dT)_rho = -(drho/dT)/(drho/dP).
+    dpde = robust::ratio(-robust::ratio(drho_dT, drho_dP), de_dT);
+    dvdt = -robust::ratio(drho_dT, r * r); // (d(1/rho)/dT)_P
+  }
 
   static constexpr unsigned long PreferredInput() { return _preferred_input; }
   int matid() const { return matid_; }
@@ -335,6 +384,11 @@ inline herr_t TableDependsPT::loadTable_(const std::string &matid_str, hid_t fil
   spiner_common::h5_safe_get_attribute<int>(grp, ".", "nT", &numT_, true);
   spiner_common::h5_safe_get_attribute<double>(matGroup, ".", SP5::Material::normalDensity,
                                                &normalDensity_, false);
+  // Mean atomic mass/number (SESAME 201), used by FLASH to set the species A/Z.
+  spiner_common::h5_safe_get_attribute<double>(matGroup, ".", SP5::Material::meanAtomicMass,
+                                               &(AZbar_.Abar), false);
+  spiner_common::h5_safe_get_attribute<double>(matGroup, ".", SP5::Material::meanAtomicNumber,
+                                               &(AZbar_.Zbar), false);
 
   P_.resize(numP_);
   T_.resize(numT_);
