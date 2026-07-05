@@ -2225,6 +2225,75 @@ class PTESolverPTCyclic
 
   static inline std::string MethodType() { return std::string("PTESolverPTCyclic"); }
 
+  // Lean (P,T)-native initialization for the cyclic solver.
+  //
+  // PTESolverPT::Init() (inherited) routes through PTESolverBase::InitBase(),
+  // which for EVERY material does
+  //     sie[m] = eos[m].InternalEnergyFromDensityTemperature(rho[m], Tguess),
+  // and gets its temperature guess from GetTguess() -> a Newton step that calls
+  // SpecificHeatFromDensityInternalEnergy(rho, sie).  On a (P,T)-indexed
+  // TableDependsPT both are (rho,T)/(rho,sie) inversions: the first bisects
+  // pressureOfRhoT_ ~100x; the second nests TemperatureFromDensityInternalEnergy
+  // (~100x) inside SpecificHeatFromDensityTemperature (~100x) for ~1e4 native
+  // lookups per material.  For the cyclic solver ALL of that work is discarded --
+  // Init() immediately overwrites rho/sie/vfrac/u from
+  // DensityEnergyFromPressureTemperature(Pequil, Tnorm).  Since TableDependsPT is
+  // pressure-preferred and the caller supplies a positive P seed in press[], we
+  // seed directly in the native (P,T) direction: one
+  // DensityEnergyFromPressureTemperature per material, no (rho,T) inversion
+  // anywhere.  This mirrors pfc _pte.py::solve_pte, which seeds from
+  // (pressure_guess, temperature_guess) with no init inversion.  Isolated to the
+  // cyclic solver: InitBase()/GetTguess() and every other PTE solver are unchanged.
+  PORTABLE_INLINE_FUNCTION
+  Real Init() {
+    // rhobar[m] and rho_total (fixed mixture quantities).
+    this->InitRhoBarandRho();
+    // Energy normalization (as in InitBase()): make Sum(u_m) ~ 1.
+    const Real utotal = rho_total * sie_total;
+    uscale = std::max(std::abs(utotal), 1.0e-14);
+    this->utotal_scale = robust::ratio(utotal, uscale);
+
+    // Temperature normalization.  Use the caller's guess (stored in Tnorm) when
+    // positive, else the largest per-material temperature, else the default --
+    // the same fallback ladder as GetTguess() minus its Newton refinement (the
+    // first CyclicStep does a T-Newton step on the enthalpy residual anyway).
+    Real Tguess = (Tnorm > 0.0) ? Tnorm : params_.default_tguess;
+    for (std::size_t m = 0; m < nmat; ++m) {
+      Tguess = std::max(Tguess, temp[m]);
+      Tguess = std::max(eos[m].MinimumTemperature(), Tguess);
+    }
+    PORTABLE_REQUIRE(Tguess > 0., "Non-positive temperature guess for PTE");
+    PORTABLE_REQUIRE(Tguess < params_.temperature_limit,
+                     "Very large input temperature or temperature guess");
+    Tnorm = Tguess;
+
+    // Equilibrium-pressure seed: vfrac-weighted |press[m]| (identical to
+    // PTESolverPT::Init()).  The caller seeds a single common mixture-match
+    // pressure, so this reduces to that pressure.
+    Real Pseed = 0.0;
+    Real vsum = 0.0;
+    for (std::size_t m = 0; m < nmat; ++m) {
+      Pseed += std::abs(press[m]) * vfrac[m];
+      vsum += vfrac[m];
+    }
+    Pseed = robust::ratio(Pseed, vsum);    // physical
+    Pequil = robust::ratio(Pseed, uscale); // scaled
+    Tequil = 1.0;                          // == Tguess / Tnorm
+
+    // One native (P,T) lookup per material fixes (rho, sie); vfrac/u/temp/press
+    // follow.  No InternalEnergyFromDensityTemperature / pressureOfRhoT_ bisection.
+    for (std::size_t m = 0; m < nmat; ++m) {
+      eos[m].DensityEnergyFromPressureTemperature(Pseed, Tguess, lambda[m], rho[m],
+                                                  sie[m]);
+      vfrac[m] = robust::ratio(rhobar[m], rho[m]);
+      u[m] = robust::ratio(sie[m] * rhobar[m], uscale);
+      temp[m] = Tequil;
+      press[m] = Pequil;
+    }
+    this->Residual();
+    return this->ResidualNorm();
+  }
+
   // One cyclic iteration: update (Pequil, Tequil), re-evaluate per-material state and the
   // mixture residual. Returns the new residual norm. (Ports _pte.py::_cyclic_step.)
   PORTABLE_INLINE_FUNCTION
