@@ -15,6 +15,11 @@
 #include "module.hpp"
 
 PYBIND11_MODULE(singularity_eos, m) {
+  py::enum_<TableSplit>(m, "TableSplit")
+    .value("Total", TableSplit::Total)
+    .value("ElectronOnly", TableSplit::ElectronOnly)
+    .value("IonCold", TableSplit::IonCold);
+
   py::class_<EOSState>(m, "EOSState")
     .def(py::init())
     .def_readwrite("density", &EOSState::density)
@@ -73,6 +78,7 @@ PYBIND11_MODULE(singularity_eos, m) {
   eos_class<SpinerEOSDependsRhoT>(m, "SpinerEOSDependsRhoT")
     .def(py::init())
     .def(py::init<const std::string&,int,bool>(), py::arg("filename"), py::arg("matid"), py::arg("reproduciblity_mode")=false)
+    .def(py::init<const std::string&,int,TableSplit,bool,bool>(), py::arg("filename"), py::arg("matid"), py::arg("split"), py::arg("reproduciblity_mode")=false, py::arg("pmin_vapor_dome")=false)
     .def(py::init<const std::string&,const std::string&,bool>(), py::arg("filename"), py::arg("materialName"), py::arg("reproduciblity_mode")=false)
     .def_property_readonly("matid", &SpinerEOSDependsRhoT::matid)
     .def_property_readonly("lRhoOffset", &SpinerEOSDependsRhoT::lRhoOffset)
