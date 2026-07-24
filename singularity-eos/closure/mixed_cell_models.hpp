@@ -24,6 +24,8 @@
 #include <singularity-eos/eos/eos.hpp>
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <utility>
 
 #ifdef SINGULARITY_USE_KOKKOSKERNELS
@@ -2051,6 +2053,10 @@ class PTESolverPT
 
   PORTABLE_INLINE_FUNCTION
   Real GetPhysicalT() const { return Tnorm * Tequil; }
+  // Physical equilibrium pressure (scaled Pequil * uscale) -- for the cyclic-solver
+  // per-iteration diagnostic in PTESolverPTCyclicSolve.
+  PORTABLE_INLINE_FUNCTION
+  Real GetPhysicalP() const { return Pequil * uscale; }
 
   // No-op debug stubs (only PTESolverRhoT has real prints)
   PORTABLE_INLINE_FUNCTION
@@ -2265,7 +2271,6 @@ class PTESolverPTCyclic
     PORTABLE_REQUIRE(Tguess > 0., "Non-positive temperature guess for PTE");
     PORTABLE_REQUIRE(Tguess < params_.temperature_limit,
                      "Very large input temperature or temperature guess");
-    Tnorm = Tguess;
 
     // Equilibrium-pressure seed: vfrac-weighted |press[m]| (identical to
     // PTESolverPT::Init()).  The caller seeds a single common mixture-match
@@ -2276,7 +2281,41 @@ class PTESolverPTCyclic
       Pseed += std::abs(press[m]) * vfrac[m];
       vsum += vfrac[m];
     }
-    Pseed = robust::ratio(Pseed, vsum);    // physical
+    Pseed = robust::ratio(Pseed, vsum); // physical
+
+    // Energy-based T refinement -- the Newton step GetTguess() takes, which this lean cyclic
+    // Init previously skipped (assuming the first CyclicStep would climb T).  That assumption
+    // fails for a cold cell whose STORED energy implies a much hotter ion equilibrium (e.g. the
+    // fuel's large ion-energy reference): seeded at the raw cell T, the first CyclicStep's
+    // T-Newton overshoots DOWN to the T-floor (Tmin) and stalls -- reproduced offline (pfc
+    // _pte.py collapses identically from a cold Tguess, and converges from a warm one).  Take up
+    // to 3 Newton steps on the energy residual at Pseed, accepting ONLY increases (GetTguess
+    // convention), so we seed near the hot energy-consistent root.  Cheap: 3 * nmat EOS evals.
+    if (params_.iterate_t_guess) {
+      // Accept-only-increases Newton on the energy residual (GetTguess convention;
+      // utotal = rho_total*sie_total is the target total energy computed above). Self-limiting
+      // for a GOOD (already-warm) guess: the first step that does not raise Tguess breaks the
+      // loop, so a warm / warm-started cell pays ~one nmat-eval round, not three -- no meaningful
+      // slowdown when the initial guess is already near the equilibrium; the extra work is spent
+      // only where it is needed (a cold guess that must climb to a hot root).
+      for (int it = 0; it < 3; ++it) {
+        Real usum = 0.0, dudt = 0.0;
+        for (std::size_t m = 0; m < nmat; ++m) {
+          Real sie_m, cv_m;
+          this->GetSieCvFromTAndPreferred(eos[m], std::min(rho[m], eos[m].MaximumDensity()),
+                                          Pseed, Tguess, lambda[m], sie_m, cv_m);
+          usum += rhobar[m] * sie_m;
+          dudt += rhobar[m] * cv_m;
+        }
+        const Real Tnew = Tguess - robust::ratio(usum - utotal, dudt);
+        if (!(Tnew > Tguess)) break; // good guess (no increase) -> stop; avoid wasted steps
+        Tguess = std::min(params_.temperature_limit, Tnew);
+      }
+      for (std::size_t m = 0; m < nmat; ++m)
+        Tguess = std::max(eos[m].MinimumTemperature(), Tguess);
+    }
+
+    Tnorm = Tguess;
     Pequil = robust::ratio(Pseed, uscale); // scaled
     Tequil = 1.0;                          // == Tguess / Tnorm
 
@@ -2394,12 +2433,29 @@ PORTABLE_INLINE_FUNCTION SolverStatus PTESolverPTCyclicSolve(System &s) {
   auto &niter = s.Niter();
   const std::size_t pte_max_iter = s.Nmat() * params.pte_max_iter_per_mat;
   status.converged = false;
+  // Per-iteration diagnostic (env PTE_CYCLIC_DEBUG): trace (P,T,residual) so a stall can be
+  // compared to the offline pfc _pte.py::solve_pte trajectory (does T climb to equilibrium?).
+  // CPU-only; checked once. Prints seed + every 20th iter + the final state, per solve.
+  static const bool cyc_dbg = (std::getenv("PTE_CYCLIC_DEBUG") != nullptr);
+  if (cyc_dbg) {
+    std::printf("[CYC] seed  P=%.6g T=%.6g r=%.4g  (pte_max_iter=%zu)\n", s.GetPhysicalP(),
+                s.GetPhysicalT(), err, pte_max_iter);
+  }
   for (niter = 0; niter < pte_max_iter; ++niter) {
     status.max_niter = std::max(status.max_niter, niter);
     auto check = s.CheckPTE();
     status.converged = check.first;
     if (status.converged) break;
     err = s.CyclicStep();
+    if (cyc_dbg && (niter % 20 == 0)) {
+      std::printf("[CYC] n=%zu P=%.6g T=%.6g r=%.4g\n", niter, s.GetPhysicalP(),
+                  s.GetPhysicalT(), err);
+    }
+  }
+  if (cyc_dbg) {
+    std::printf("[CYC] end   conv=%d niter=%zu P=%.6g T=%.6g r=%.4g\n",
+                static_cast<int>(status.converged), niter, s.GetPhysicalP(), s.GetPhysicalT(),
+                err);
   }
   s.Finalize();
   return status;
