@@ -79,6 +79,17 @@ namespace singularity {
 
 using namespace eos_base;
 
+// Diagnostic call counters (a plain global ++ per call; negligible cost -- used by the offline
+// micro-bench AND, via a bind(C) getter, by FLASH's eos_pteDiag to report real per-cell op
+// counts.  Remove before the production commit if truly hot).
+namespace sg_rhot_acct {
+inline long g_evalRhoT = 0;      // fundamental (rho,T) interpolation
+inline long g_densityOfPT = 0;   // (P,T)->rho root (analytic or scan)
+inline long g_rootBisect = 0;    // flat-cell bisection fallbacks inside rootInCell
+inline long g_TfromE = 0;        // (rho,e)->T inversions (grid-search; fallback bisection)
+inline void reset() { g_evalRhoT = g_densityOfPT = g_rootBisect = g_TfromE = 0; }
+}
+
 class TableDependsRhoT : public EosBase<TableDependsRhoT> {
   friend class table_utils::SpinerTricks<TableDependsRhoT>;
   using SpinerTricks = table_utils::SpinerTricks<TableDependsRhoT>;
@@ -334,6 +345,7 @@ class TableDependsRhoT : public EosBase<TableDependsRhoT> {
   // outputs come from ONE interpolant, so they are mutually consistent.
   PORTABLE_INLINE_FUNCTION void evalRhoT_(Real rho, Real t, Real &P, Real &e, Real &dP_drho,
                                           Real &dP_dT, Real &de_drho, Real &de_dT) const {
+    ++sg_rhot_acct::g_evalRhoT;
     const int i = cell_(rhoGrid_, numRho_, std::min(std::max(rho, rhoMin_), rhoMax_));
     int j;
     Real w;
@@ -486,6 +498,7 @@ inline herr_t TableDependsRhoT::loadTable_(const std::string &matid_str, hid_t f
 // interval where P(rho;T) crosses `press` while INCREASING (P_rho>0) -- the condensed branch.
 // Off-branch queries clamp to the nearer grid end.  (Port of RhoTPteEos._density_at.)
 PORTABLE_INLINE_FUNCTION Real TableDependsRhoT::densityOfPT_(Real press, Real temp) const {
+  ++sg_rhot_acct::g_densityOfPT;
   const Real t = clampT_(temp);
   int j;
   Real w;
@@ -505,6 +518,7 @@ PORTABLE_INLINE_FUNCTION Real TableDependsRhoT::densityOfPT_(Real press, Real te
       const Real wr = (press - pa) / denom;
       return rhoGrid_(k) + wr * (rhoGrid_(k + 1) - rhoGrid_(k));
     }
+    ++sg_rhot_acct::g_rootBisect;
     Real rlo = rhoGrid_(k), rhi = rhoGrid_(k + 1); // flat cell: robust sign-based bisection
     for (int it = 0; it < 100; ++it) {
       const Real rm = 0.5 * (rlo + rhi);
@@ -623,14 +637,19 @@ PORTABLE_INLINE_FUNCTION Real TableDependsRhoT::BulkModulusFromDensityTemperatur
 }
 
 // Invert e(rho,T) for T at fixed rho by bisection (rho fixed, e monotone increasing in T).
+// NB: this ~40-iteration full-range bisection (each iter an evalRhoT_) drives a large share of
+// the cyclic solve's interpolation work (bench_pte_solve.cpp); a T-grid binary-search + analytic
+// in-cell solve is ~5x cheaper but needs a robust non-monotone (cv fit-artifact) fallback -- see
+// pte_tools/prove_tfrome_fastpath.py.  Kept as bisection until that is proven identical.
 template <typename Indexer_t>
 PORTABLE_INLINE_FUNCTION Real TableDependsRhoT::TemperatureFromDensityInternalEnergy(
     const Real rho, const Real sie, Indexer_t &&lambda) const {
+  ++sg_rhot_acct::g_TfromE;
+  const Real r = std::min(std::max(rho, rhoMin_), rhoMax_);
   Real tlo = Tmin_, thi = Tmax_;
   for (int it = 0; it < 100; ++it) {
     const Real tm = 0.5 * (tlo + thi);
-    const Real em = InternalEnergyFromDensityTemperature(rho, tm, lambda);
-    if (em < sie)
+    if (InternalEnergyFromDensityTemperature(r, tm, lambda) < sie)
       tlo = tm;
     else
       thi = tm;
@@ -643,17 +662,27 @@ template <typename Indexer_t>
 PORTABLE_INLINE_FUNCTION void
 TableDependsRhoT::FillEos(Real &rho, Real &temp, Real &energy, Real &press, Real &cv,
                           Real &bmod, const unsigned long output, Indexer_t &&lambda) const {
-  if (output & thermalqs::density && output & thermalqs::specific_internal_energy) {
+  // A (P,T)->(rho,e) request resolves rho first; everything else is a (rho,T) evaluation.
+  const bool from_pt =
+      (output & thermalqs::density) && (output & thermalqs::specific_internal_energy);
+  if (from_pt) {
     DensityEnergyFromPressureTemperature(press, temp, lambda, rho, energy);
-  } else {
-    if (output & thermalqs::pressure) press = PressureFromDensityTemperature(rho, temp, lambda);
-    if (output & thermalqs::specific_internal_energy)
-      energy = InternalEnergyFromDensityTemperature(rho, temp, lambda);
   }
-  if (output & thermalqs::specific_heat)
-    cv = SpecificHeatFromDensityTemperature(rho, temp, lambda);
-  if (output & thermalqs::bulk_modulus)
-    bmod = BulkModulusFromDensityTemperature(rho, temp, lambda);
+  // FUSE: fill any remaining requested (rho,T) quantities (P, e, cv, bmod) from ONE evalRhoT_
+  // instead of a separate accessor per quantity each re-interpolating the same point.
+  // Bitwise-identical (same clamps, same interpolant; cv = de/dT, bmod = rho dP/drho).
+  const unsigned long rhoT_out =
+      (from_pt ? 0UL : (thermalqs::pressure | thermalqs::specific_internal_energy)) |
+      thermalqs::specific_heat | thermalqs::bulk_modulus;
+  if (output & rhoT_out) {
+    const Real r = std::min(std::max(rho, rhoMin_), rhoMax_);
+    Real P, e, p_rho, p_t, e_rho, e_t;
+    evalRhoT_(r, clampT_(temp), P, e, p_rho, p_t, e_rho, e_t);
+    if (!from_pt && (output & thermalqs::pressure)) press = P;
+    if (!from_pt && (output & thermalqs::specific_internal_energy)) energy = e;
+    if (output & thermalqs::specific_heat) cv = e_t;
+    if (output & thermalqs::bulk_modulus) bmod = r * p_rho;
+  }
 }
 
 } // namespace singularity

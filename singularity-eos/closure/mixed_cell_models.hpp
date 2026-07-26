@@ -1135,7 +1135,11 @@ class PTESolverBase {
         Pguess = std::max(Pmin, std::min(Pmax, P));
       }
       eos.DensityEnergyFromPressureTemperature(Pguess, T, lambda, rho, sie);
-      cv = eos.SpecificHeatFromDensityInternalEnergy(rho, sie, lambda);
+      // T is KNOWN here, so read cv directly at (rho, T).  The former
+      // SpecificHeatFromDensityInternalEnergy(rho, sie) RE-INVERTED (rho,sie)->T (a ~40-iteration
+      // bisection) just to recover the T we already have -- pure redundant work in the cyclic
+      // Init's T-guess loop (~3 inversions/cell).  cv is identical (the round trip returns T).
+      cv = eos.SpecificHeatFromDensityTemperature(rho, T, lambda);
     } else { // use density, not pressure.
       sie = eos.InternalEnergyFromDensityTemperature(rho, T, lambda);
       cv = eos.SpecificHeatFromDensityTemperature(rho, T, lambda);
