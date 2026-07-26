@@ -359,7 +359,9 @@ class TableDependsRhoT : public EosBase<TableDependsRhoT> {
   }
 
   // Dense-branch root: densest rho with P(rho;T) = press on an INCREASING crossing (P_rho>0).
-  // Direct port of RhoTPteEos._density_at (pfc/sim/matdata/_pte_rhot.py).
+  // Direct port of RhoTPteEos._density_at (pfc/sim/matdata/_pte_rhot.py).  Binary-searches the
+  // column's top monotone run when press lands in it (the compressed-branch common case), else
+  // linear-scans from the dense end; both return the analytic in-cell root (P linear in rho).
   PORTABLE_INLINE_FUNCTION Real densityOfPT_(Real press, Real temp) const;
 
   static constexpr Real RHO_ROOT_TOL_ = 1.0e-12; // matches _pte_rhot.py::_RHO_XTOL
@@ -371,6 +373,10 @@ class TableDependsRhoT : public EosBase<TableDependsRhoT> {
   // 1-D node arrays + 2-D fields [numRho_(slow), numT_(fast)].
   DataBox rhoGrid_, T_;
   DataBox P_, sie_, dPdRho_, dPdT_, dEdRho_, dEdT_;
+  // Per-T-column start index of the top monotone-increasing run of P(:,j) (host-computed at
+  // load; empty => warm-start disabled, always full scan).  Guards the localized density scan
+  // so it can never skip a denser crossing.  Not serialized (derived from P_; host-only).
+  std::vector<int> mMono_;
 #define DBLIST &rhoGrid_, &T_, &P_, &sie_, &dPdRho_, &dPdT_, &dEdRho_, &dEdT_
   std::vector<const DataBox *> GetDataBoxPointers_() const {
     return std::vector<const DataBox *>{DBLIST};
@@ -459,6 +465,16 @@ inline herr_t TableDependsRhoT::loadTable_(const std::string &matid_str, hid_t f
   Tmin_ = T_(0);
   Tmax_ = T_(numT_ - 1);
 
+  // Top monotone-increasing run start per T-column: smallest m with P(k+1,j) > P(k,j) for all
+  // k in [m, numRho_-2].  A localized density scan starting at k+1 >= m (on the high-P side)
+  // cannot skip a denser increasing crossing, so it matches the full dense-end scan exactly.
+  mMono_.resize(numT_);
+  for (int j = 0; j < numT_; ++j) {
+    int m = numRho_ - 1;
+    while (m - 1 >= 0 && P_(m, j) > P_(m - 1, j)) --m;
+    mMono_[j] = m;
+  }
+
   spiner_common::h5_safe_gclose(grp);
   spiner_common::h5_safe_gclose(matGroup);
   return 0;
@@ -475,28 +491,66 @@ PORTABLE_INLINE_FUNCTION Real TableDependsRhoT::densityOfPT_(Real press, Real te
   Real w;
   tWeight_(t, j, w);
   auto Pcol = [&](int i) -> Real { return (1.0 - w) * P_(i, j) + w * P_(i, j + 1); };
-  // Scan from the dense end (high i) toward low density for the densest increasing crossing.
+  // Root within [rhoGrid_(k), rhoGrid_(k+1)].  Pcol is LINEAR in rho across the cell, so the root
+  // is the analytic linear interpolation -- ONE division, no iteration (the former 1e-12 bisection
+  // ran ~40 iterations x several DataBox reads and dominated the whole accessor).  In a nearly
+  // rho-INDEPENDENT cell (hot-plasma flat region) the ratio (press-pa)/(pb-pa) suffers
+  // catastrophic cancellation (pa~pb~1e16 differing in the last few digits), so fall back to
+  // sign-based bisection there (rare; matches the old root).  Steep condensed-branch cells (the
+  // common mixed-cell case) take the cheap analytic path.
+  auto rootInCell = [&](int k) -> Real {
+    const Real pa = Pcol(k), pb = Pcol(k + 1);
+    const Real denom = pb - pa;
+    if (std::abs(denom) > 1.0e-6 * (std::abs(pa) + std::abs(pb))) { // well-conditioned
+      const Real wr = (press - pa) / denom;
+      return rhoGrid_(k) + wr * (rhoGrid_(k + 1) - rhoGrid_(k));
+    }
+    Real rlo = rhoGrid_(k), rhi = rhoGrid_(k + 1); // flat cell: robust sign-based bisection
+    for (int it = 0; it < 100; ++it) {
+      const Real rm = 0.5 * (rlo + rhi);
+      const Real wr = (rm - rhoGrid_(k)) / (rhoGrid_(k + 1) - rhoGrid_(k));
+      const Real pm = (1.0 - wr) * pa + wr * pb - press;
+      if (pm < 0.0)
+        rlo = rm;
+      else
+        rhi = rm;
+      if ((rhi - rlo) <= RHO_ROOT_TOL_ * (std::abs(rm) + RHO_ROOT_TOL_)) break;
+    }
+    return 0.5 * (rlo + rhi);
+  };
+
+  // Fast path: the DENSEST increasing crossing lives in the column's top monotone-increasing run
+  // [mMonoQ, numRho_-1] (strictly increasing, so any crossing there is denser than anything below
+  // it).  When press is within that run's pressure range, BINARY-SEARCH it -- O(log numRho) vs the
+  // O(numRho) dense-end linear scan -- and the result is identical to the full scan (same densest
+  // crossing).  If press is at/below the run's floor (=> the crossing, if any, is in the
+  // low-density non-monotone region) or the run degenerates, fall through to the full scan.
+  if (!mMono_.empty()) {
+    const int mMonoQ = (j + 1 < numT_) ? std::max(mMono_[j], mMono_[j + 1]) : mMono_[j];
+    if (mMonoQ <= numRho_ - 2) {
+      const Real p_floor = Pcol(mMonoQ), p_top = Pcol(numRho_ - 1);
+      if (press > p_floor && press <= p_top) {
+        int lo = mMonoQ, hi = numRho_ - 1; // Pcol(lo) < press <= Pcol(hi), run increasing
+        while (hi - lo > 1) {
+          const int mid = (lo + hi) / 2;
+          if (Pcol(mid) < press)
+            lo = mid;
+          else
+            hi = mid;
+        }
+        if (Pcol(hi) == press) return rhoGrid_(hi); // exact node (matches full-scan d==0 branch)
+        return rootInCell(lo);
+      }
+    }
+  }
+
+  // Full scan from the dense end (high i) toward low density for the densest increasing crossing.
   for (int k = numRho_ - 2; k >= 0; --k) {
     const Real d0 = Pcol(k) - press;
     const Real d1 = Pcol(k + 1) - press;
     if (d1 == 0.0) return rhoGrid_(k + 1);
     if (d0 == 0.0) return rhoGrid_(k);
-    if (d0 < 0.0 && 0.0 < d1) { // increasing crossing => condensed branch
-      // Bisection for the root within [rhoGrid_(k), rhoGrid_(k+1)] (linear-in-rho within cell,
-      // so this converges immediately; kept general for robustness).
-      Real rlo = rhoGrid_(k), rhi = rhoGrid_(k + 1);
-      for (int it = 0; it < 100; ++it) {
-        const Real rm = 0.5 * (rlo + rhi);
-        const Real wr = (rm - rhoGrid_(k)) / (rhoGrid_(k + 1) - rhoGrid_(k));
-        const Real pm = (1.0 - wr) * Pcol(k) + wr * Pcol(k + 1) - press; // linear-in-rho
-        if (pm < 0.0)
-          rlo = rm;
-        else
-          rhi = rm;
-        if ((rhi - rlo) <= RHO_ROOT_TOL_ * (std::abs(rm) + RHO_ROOT_TOL_)) break;
-      }
-      return 0.5 * (rlo + rhi);
-    }
+    if (d0 < 0.0 && 0.0 < d1) return rootInCell(k); // increasing crossing => condensed branch
   }
   // No interior condensed crossing: clamp to the nearer grid end.
   return (press >= Pcol(numRho_ - 1)) ? rhoGrid_(numRho_ - 1) : rhoGrid_(0);
