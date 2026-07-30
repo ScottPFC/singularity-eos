@@ -370,10 +370,29 @@ class TableDependsRhoT : public EosBase<TableDependsRhoT> {
     return (1.0 - w) * P_(i, j) + w * P_(i, j + 1);
   }
 
+  // Saturation pressure P_sat(T) [cgs] on the shipped L-V dome by linear interp; returns <0 if
+  // there is no dome or T is outside the dome range (=> no vapor branch, dense root used).
+  PORTABLE_INLINE_FUNCTION Real pSatAt_(Real t) const {
+    const int n = static_cast<int>(satT_.size());
+    if (n < 2 || t < satT_[0] || t > satT_[n - 1]) return -1.0;
+    int lo = 0, hi = n - 1;
+    while (hi - lo > 1) {
+      const int mid = (lo + hi) / 2;
+      if (satT_[mid] <= t)
+        lo = mid;
+      else
+        hi = mid;
+    }
+    const Real w = (t - satT_[lo]) / (satT_[hi] - satT_[lo]);
+    return (1.0 - w) * satPsat_[lo] + w * satPsat_[hi];
+  }
+
   // Dense-branch root: densest rho with P(rho;T) = press on an INCREASING crossing (P_rho>0).
   // Direct port of RhoTPteEos._density_at (pfc/sim/matdata/_pte_rhot.py).  Binary-searches the
   // column's top monotone run when press lands in it (the compressed-branch common case), else
   // linear-scans from the dense end; both return the analytic in-cell root (P linear in rho).
+  // Branch-aware: below P_sat(T) inside the L-V dome it first takes the VAPOR (least-dense)
+  // crossing (port of BranchAwareRhoTPteEos), gated on the shipped dome.
   PORTABLE_INLINE_FUNCTION Real densityOfPT_(Real press, Real temp) const;
 
   static constexpr Real RHO_ROOT_TOL_ = 1.0e-12; // matches _pte_rhot.py::_RHO_XTOL
@@ -389,6 +408,11 @@ class TableDependsRhoT : public EosBase<TableDependsRhoT> {
   // load; empty => warm-start disabled, always full scan).  Guards the localized density scan
   // so it can never skip a denser crossing.  Not serialized (derived from P_; host-only).
   std::vector<int> mMono_;
+  // Optional L-V saturation dome (root /saturation/vapor_liquid), for branch-aware (P,T)->rho:
+  // below P_sat(T) inside the dome the physical single-phase root is the VAPOR (least-dense)
+  // branch, not the dense one. cgs (satPsat_ converted GPa->dyne/cm^2 at load). Empty => the
+  // surface has no shipped dome => dense-only root (backward-compatible). Host-only (like mMono_).
+  std::vector<double> satT_, satPsat_;
 #define DBLIST &rhoGrid_, &T_, &P_, &sie_, &dPdRho_, &dPdT_, &dEdRho_, &dEdT_
   std::vector<const DataBox *> GetDataBoxPointers_() const {
     return std::vector<const DataBox *>{DBLIST};
@@ -487,6 +511,36 @@ inline herr_t TableDependsRhoT::loadTable_(const std::string &matid_str, hid_t f
     mMono_[j] = m;
   }
 
+  // Optional L-V dome for branch-aware (P,T)->rho: root /saturation/vapor_liquid/{temperature,
+  // p_sat}. Absent => satT_/satPsat_ stay empty => dense-only root (backward-compatible). p_sat
+  // is stored in GPa (matdata-canonical) -> convert to cgs (dyne/cm^2) to match the surface P_.
+  if (H5Lexists(file, "saturation", H5P_DEFAULT) > 0) {
+    hid_t satRoot = H5Gopen2(file, "saturation", H5P_DEFAULT);
+    if (satRoot >= 0) {
+      if (H5Lexists(satRoot, "vapor_liquid", H5P_DEFAULT) > 0) {
+        hid_t vl = H5Gopen2(satRoot, "vapor_liquid", H5P_DEFAULT);
+        if (vl >= 0) {
+          hid_t tds = H5Dopen2(vl, "temperature", H5P_DEFAULT);
+          if (tds >= 0) {
+            hid_t sp = H5Dget_space(tds);
+            const hssize_t nsat = H5Sget_simple_extent_npoints(sp);
+            if (nsat > 1) {
+              satT_.resize(static_cast<std::size_t>(nsat));
+              satPsat_.resize(static_cast<std::size_t>(nsat));
+              H5LTread_dataset_double(vl, "temperature", satT_.data());
+              H5LTread_dataset_double(vl, "p_sat", satPsat_.data());
+              for (auto &x : satPsat_) x *= 1.0e10; // GPa -> dyne/cm^2 (cgs)
+            }
+            H5Sclose(sp);
+            H5Dclose(tds);
+          }
+          H5Gclose(vl);
+        }
+      }
+      H5Gclose(satRoot);
+    }
+  }
+
   spiner_common::h5_safe_gclose(grp);
   spiner_common::h5_safe_gclose(matGroup);
   return 0;
@@ -532,6 +586,22 @@ PORTABLE_INLINE_FUNCTION Real TableDependsRhoT::densityOfPT_(Real press, Real te
     }
     return 0.5 * (rlo + rhi);
   };
+
+  // Branch-aware: below P_sat(T) inside the L-V dome the physical single-phase root is the VAPOR
+  // (least-dense increasing) crossing, not the dense one -- a raw loop-bearing surface exposes
+  // both branches, so the dense-end scan below would wrongly return liquid for a vapor cell.
+  // Scan from the LIGHT end for the first increasing crossing; if none is here (or no dome), fall
+  // through to the dense scan. (Port of BranchAwareRhoTPteEos._vapor_density_at.)
+  const Real psat = pSatAt_(t);
+  if (psat > 0.0 && press < psat) {
+    for (int k = 0; k <= numRho_ - 2; ++k) {
+      const Real d0 = Pcol(k) - press;
+      const Real d1 = Pcol(k + 1) - press;
+      if (d0 == 0.0) return rhoGrid_(k);
+      if (d1 == 0.0) return rhoGrid_(k + 1);
+      if (d0 < 0.0 && 0.0 < d1) return rootInCell(k); // least-dense increasing => vapor branch
+    }
+  }
 
   // Fast path: the DENSEST increasing crossing lives in the column's top monotone-increasing run
   // [mMonoQ, numRho_-1] (strictly increasing, so any crossing there is denser than anything below

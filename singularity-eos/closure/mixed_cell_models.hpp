@@ -2346,16 +2346,27 @@ class PTESolverPTCyclic
     const Real P = Pequil * uscale, T = Tequil * Tnorm; // physical
     const Mix mix = mixture_(P, T);
 
+    // Aggregate box once (P bounds depend on the current T reference).
+    Real Plo, Phi, Tlo, Thi;
+    Box_(Plo, Phi, Tlo, Thi, T);
+
     // Step 1: Newton step in P on the density residual varrho = 1/tau - 1/tau0.
     const Real varrho = robust::ratio(1.0, mix.tau) - robust::ratio(1.0, tau0);
     const Real dvarrho_dp = -mix.dtau_dp / (mix.tau * mix.tau);
     Real p_tilde = (dvarrho_dp == 0.0) ? P : P - varrho / dvarrho_dp;
+    // Safeguarded Newton: keep the intermediate P inside the box (the domain R that Thm 5.2's
+    // well-posedness assumes) BEFORE the mixture eval below.  Alg 5.2 clamps only the final
+    // (P,T), but a tabular EOS is stable only on R: a P-Newton overshoot to P<=0 lands on the
+    // near-vacuum branch (K_T~0, c_p<0), poisoning the enthalpy/tangent step and collapsing T
+    // to the floor.  Mirrors pfc _pte.py::_cyclic_step.
+    p_tilde = std::min(std::max(p_tilde, Plo), Phi);
 
     // Step 2: Newton step in T on the enthalpy residual h at (p_tilde, T); d_T h = c_p.
     const Mix mix_p = mixture_(p_tilde, T);
     const Real enth = (mix_p.e + p_tilde * mix_p.tau) - (e0 + p_tilde * tau0);
     const Real c_p = mix_p.de_dt + p_tilde * mix_p.dtau_dt;
-    const Real t_tilde = (c_p == 0.0) ? T : T - enth / c_p;
+    Real t_tilde = (c_p == 0.0) ? T : T - enth / c_p;
+    t_tilde = std::min(std::max(t_tilde, Tlo), Thi);  // same safeguard on the intermediate T
 
     // Step 3: intersect the tau-level-set tangent at (p_tilde, T) with the isentrope
     // tangent at (p_tilde, t_tilde); fall back to the enthalpy-curve tangent.
@@ -2409,7 +2420,12 @@ class PTESolverPTCyclic
     for (std::size_t m = 1; m < nmat; ++m) {
       Plo = std::max(Plo, eos[m].MinimumPressure());
       Phi = std::min(Phi, eos[m].MaximumPressureAtTemperature(Tref));
-      Tlo = std::max(Tlo, eos[m].MinimumTemperature());
+      // T floor: MIN over materials, not MAX.  A trace material with a higher SESAME grid Tmin
+      // (e.g. Cu starts at 20 K) must NOT floor a fuel-dominated cold cell above the fuel's Tmin
+      // (~15 K) -- that excludes the true cold solution and collapses the solve.  Each material's
+      // evaluate clamps T to its own grid, so a minor material below its Tmin extrapolates as a
+      // clamp (negligible at trace mass fraction).
+      Tlo = std::min(Tlo, eos[m].MinimumTemperature());
     }
   }
   PORTABLE_INLINE_FUNCTION bool InBox_(const Real P, const Real T) const {
