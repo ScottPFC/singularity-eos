@@ -1221,7 +1221,10 @@ class PTESolverBase {
     Real Pideal, Tideal;
     GetIdealPTE(Pideal, Tideal);
 
-    // temporarily hijack some of the scratch space
+    // Temporarily hijack the head of the scratch buffer.  This needs 4*nmat + neq doubles, which
+    // every solver's *RequiredScratch guarantees via PTEScratchWithIdealPTE -- do not add arrays
+    // here without widening that bound, and note it overwrites dx/sol_scratch (and, for a small
+    // jacobian, u/rhobar) so everything read below is copied out FIRST and restored on failure.
     Real *etemp = jacobian;
     Real *ptemp = jacobian + nmat;
     Real *vtemp = jacobian + 2 * nmat;
@@ -1394,14 +1397,26 @@ PORTABLE_INLINE_FUNCTION Real ApproxTemperatureFromRhoMatU(
  *
  */
 // clang-format on
+// PTESolverBase::TryIdealPTE temporarily hijacks the HEAD of the scratch buffer as five arrays
+// (etemp, ptemp, vtemp, rtemp of nmat each, then res of neq), so every solver's scratch must hold
+// at least 4*nmat + neq regardless of what its own Jacobian needs.  That requirement is invisible
+// where neq grows with nmat -- the jacobian alone covers it -- but the (P,T) solvers fix neq = 2,
+// so for them the hijack reaches past the buffer once nmat >= 5.  Wrapping every requirement in
+// this max() makes the coupling explicit and is a no-op wherever the Jacobian already dominates.
+constexpr inline std::size_t PTEScratchWithIdealPTE(const std::size_t own, const std::size_t nmat,
+                                                    const std::size_t neq) {
+  return (own > 4 * nmat + neq) ? own : (4 * nmat + neq);
+}
+
 // ======================================================================
 // PTE Solver RhoT
 // ======================================================================
 constexpr inline int PTESolverRhoTRequiredScratch(const std::size_t nmat) {
   std::size_t neq = nmat;
-  return neq * neq   // jacobian
-         + 4 * neq   // dx, residual, and sol_scratch
-         + 6 * nmat; // all the nmat sized arrays
+  return static_cast<int>(PTEScratchWithIdealPTE(neq * neq // jacobian
+                                                     + 4 * neq // dx, residual, sol_scratch
+                                                     + 6 * nmat, // all the nmat sized arrays
+                                                 nmat, neq));
 }
 constexpr inline size_t PTESolverRhoTRequiredScratchInBytes(const std::size_t nmat) {
   return PTESolverRhoTRequiredScratch(nmat) * sizeof(Real);
@@ -1817,10 +1832,14 @@ class PTESolverRhoT
 // PT space solver
 // ======================================================================
 constexpr inline int PTESolverPTRequiredScratch(const std::size_t nmat) {
-  constexpr int neq = 2;
-  return neq * neq   // jacobian
-         + 4 * neq   // dx, residual, and sol_scratch
-         + 2 * nmat; // all the nmat sized arrays
+  // neq is FIXED at 2 here (the (P,T) solvers carry one pressure and one temperature unknown, not
+  // one per material), so unlike every other solver the jacobian does not grow with nmat and does
+  // not cover TryIdealPTE's 4*nmat + neq hijack.  See PTEScratchWithIdealPTE.
+  constexpr std::size_t neq = 2;
+  return static_cast<int>(PTEScratchWithIdealPTE(neq * neq // jacobian
+                                                     + 4 * neq // dx, residual, sol_scratch
+                                                     + 2 * nmat, // all the nmat sized arrays
+                                                 nmat, neq));
 }
 constexpr inline size_t PTESolverPTRequiredScratchInBytes(const std::size_t nmat) {
   return PTESolverPTRequiredScratch(nmat) * sizeof(Real);
@@ -2486,10 +2505,11 @@ PORTABLE_INLINE_FUNCTION SolverStatus PTESolverPTCyclicSolve(System &s) {
 // ======================================================================
 constexpr inline std::size_t PTESolverFixedTRequiredScratch(const std::size_t nmat) {
   std::size_t neq = nmat;
-  return neq * neq   // jacobian
-         + 4 * neq   // dx, residual, and sol_scratch
-         + 2 * nmat  // rhobar and u in base
-         + 2 * nmat; // nmat sized arrays in fixed T solver
+  return PTEScratchWithIdealPTE(neq * neq // jacobian
+                                    + 4 * neq // dx, residual, and sol_scratch
+                                    + 2 * nmat // rhobar and u in base
+                                    + 2 * nmat, // nmat sized arrays in fixed T solver
+                                nmat, neq);
 }
 constexpr inline size_t PTESolverFixedTRequiredScratchInBytes(const std::size_t nmat) {
   return PTESolverFixedTRequiredScratch(nmat) * sizeof(Real);
@@ -2715,10 +2735,11 @@ class PTESolverFixedT
 // ======================================================================
 constexpr inline std::size_t PTESolverFixedPRequiredScratch(const std::size_t nmat) {
   std::size_t neq = nmat + 1;
-  return neq * neq   // jacobian
-         + 4 * neq   // dx, residual, and sol_scratch
-         + 2 * nmat  // all the nmat sized arrays in base
-         + 3 * nmat; // all the nmat sized arrays in fixedP
+  return PTEScratchWithIdealPTE(neq * neq // jacobian
+                                    + 4 * neq // dx, residual, and sol_scratch
+                                    + 2 * nmat // all the nmat sized arrays in base
+                                    + 3 * nmat, // all the nmat sized arrays in fixedP
+                                nmat, neq);
 }
 constexpr inline size_t PTESolverFixedPRequiredScratchInBytes(const std::size_t nmat) {
   return PTESolverFixedPRequiredScratch(nmat) * sizeof(Real);
@@ -2971,9 +2992,10 @@ class PTESolverFixedP
 // ======================================================================
 constexpr inline std::size_t PTESolverRhoURequiredScratch(const std::size_t nmat) {
   std::size_t neq = 2 * nmat;
-  return neq * neq   // jacobian
-         + 4 * neq   // dx, residual, and sol_scratch
-         + 8 * nmat; // all the nmat sized arrays
+  return PTEScratchWithIdealPTE(neq * neq // jacobian
+                                    + 4 * neq // dx, residual, and sol_scratch
+                                    + 8 * nmat, // all the nmat sized arrays
+                                nmat, neq);
 }
 constexpr inline size_t PTESolverRhoURequiredScratchInBytes(const std::size_t nmat) {
   return PTESolverRhoURequiredScratch(nmat) * sizeof(Real);
