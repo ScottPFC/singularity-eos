@@ -79,6 +79,7 @@ register_headers(
 if (SINGULARITY_BUILD_CLOSURE)
   register_headers(
     closure/mixed_cell_models.hpp
+    closure/pte_cyclic_rhoe.hpp
     closure/kinetic_phasetransition_models.hpp
     closure/kinetic_phasetransition_utils.hpp
     closure/kinetic_phasetransition_methods.hpp
