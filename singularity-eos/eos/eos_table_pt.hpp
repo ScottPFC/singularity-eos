@@ -100,10 +100,14 @@ class TableDependsPT : public EosBase<TableDependsPT> {
   std::size_t DumpDynamicMemory(char *dst) {
     return SpinerTricks::DumpDynamicMemory(dst, this);
   }
+  // See the twin comment in eos_table_rhot.hpp: the databoxes must be pointed at the SHARED
+  // allocation when one is supplied, or every rank keeps its own copy and dangles when the
+  // caller frees its packed buffer.
   std::size_t SetDynamicMemory(char *src,
                                const SharedMemSettings &stngs = DEFAULT_SHMEM_STNGS) {
-    if (stngs.data != nullptr) sharedMemory_ = stngs.data;
-    return SpinerTricks::SetDynamicMemory(src, this);
+    char *base = (stngs.data == nullptr) ? src : stngs.data;
+    sharedMemory_ = stngs.data;
+    return SpinerTricks::SetDynamicMemory(base, this);
   }
 
   PORTABLE_INLINE_FUNCTION void CheckParams() const {

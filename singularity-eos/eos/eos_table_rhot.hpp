@@ -119,10 +119,17 @@ class TableDependsRhoT : public EosBase<TableDependsRhoT> {
   std::size_t DumpDynamicMemory(char *dst) {
     return SpinerTricks::DumpDynamicMemory(dst, this);
   }
+  // Point the databoxes at the SHARED allocation whenever one is supplied, exactly as
+  // SpinerEOSDependsRhoT::SetDynamicMemory does. Recording `stngs.data` and then handing
+  // SpinerTricks `src` anyway -- the previous behaviour -- left every rank's databoxes aimed at
+  // its OWN packed buffer, so nothing was shared and the pointers dangled the moment the caller
+  // freed that buffer, which the documented MPI recipe does immediately after DeSerialize.
+  // `sharedMemory_` was written and never read, so the bug was silent.
   std::size_t SetDynamicMemory(char *src,
                                const SharedMemSettings &stngs = DEFAULT_SHMEM_STNGS) {
-    if (stngs.data != nullptr) sharedMemory_ = stngs.data;
-    return SpinerTricks::SetDynamicMemory(src, this);
+    char *base = (stngs.data == nullptr) ? src : stngs.data;
+    sharedMemory_ = stngs.data;
+    return SpinerTricks::SetDynamicMemory(base, this);
   }
 
   PORTABLE_INLINE_FUNCTION void CheckParams() const {
