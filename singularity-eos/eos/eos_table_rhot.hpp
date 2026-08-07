@@ -187,12 +187,23 @@ class TableDependsRhoT : public EosBase<TableDependsRhoT> {
     PORTABLE_ALWAYS_THROW_OR_ABORT("Entropy not implemented for TableDependsRhoT");
     return 0.0;
   }
+  // Gamma = (1/rho) (dP/de)_rho = (1/rho) (dP/dT)_rho / (de/dT)_rho -- exact and LOCAL in the
+  // fields this table already stores, so no new data and no integration.  Implemented because
+  // the lever closure reaches it once it pins a material to a tie-line: aborting here took down
+  // RUN160/RUN161 at the step the liner first went two-phase.
+  //
+  // On a flat tie-line (de/dT)_rho is the two-phase c_v, which is large but finite, so the ratio
+  // is well behaved there.  Where c_v underflows to zero the parameter is genuinely undefined;
+  // return 0 (Gamma -> 0 means pressure independent of energy) rather than a signed infinity that
+  // would poison a caller's linear algebra.
   template <typename Indexer_t = Real *>
-  PORTABLE_INLINE_FUNCTION Real
-  GruneisenParamFromDensityTemperature(const Real, const Real,
-                                       Indexer_t && = static_cast<Real *>(nullptr)) const {
-    PORTABLE_ALWAYS_THROW_OR_ABORT("Gruneisen not implemented for TableDependsRhoT");
-    return 0.0;
+  PORTABLE_INLINE_FUNCTION Real GruneisenParamFromDensityTemperature(
+      const Real rho, const Real temperature,
+      Indexer_t && = static_cast<Real *>(nullptr)) const {
+    const Real r = std::min(std::max(rho, rhoMin_), rhoMax_);
+    Real P, e, p_rho, p_t, e_rho, e_t;
+    evalRhoT_(r, clampT_(temperature), P, e, p_rho, p_t, e_rho, e_t);
+    return (e_t > 0.0) ? p_t / (r * e_t) : 0.0;
   }
 
   // (rho, sie) aux variants (mirror TableDependsPT): pressure/heat go through the T inversion;
@@ -226,11 +237,11 @@ class TableDependsRhoT : public EosBase<TableDependsRhoT> {
         rho, TemperatureFromDensityInternalEnergy(rho, sie, lambda), lambda);
   }
   template <typename Indexer_t = Real *>
-  PORTABLE_INLINE_FUNCTION Real
-  GruneisenParamFromDensityInternalEnergy(const Real, const Real,
-                                          Indexer_t && = static_cast<Real *>(nullptr)) const {
-    PORTABLE_ALWAYS_THROW_OR_ABORT("Gruneisen not implemented for TableDependsRhoT");
-    return 0.0;
+  PORTABLE_INLINE_FUNCTION Real GruneisenParamFromDensityInternalEnergy(
+      const Real rho, const Real sie,
+      Indexer_t &&lambda = static_cast<Real *>(nullptr)) const {
+    return GruneisenParamFromDensityTemperature(
+        rho, TemperatureFromDensityInternalEnergy(rho, sie, lambda), lambda);
   }
 
   template <typename Indexer_t = Real *>
