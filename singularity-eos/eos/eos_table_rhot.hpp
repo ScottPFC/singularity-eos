@@ -54,6 +54,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -79,15 +80,72 @@ namespace singularity {
 
 using namespace eos_base;
 
-// Diagnostic call counters (a plain global ++ per call; negligible cost -- used by the offline
-// micro-bench AND, via a bind(C) getter, by FLASH's eos_pteDiag to report real per-cell op
-// counts.  Remove before the production commit if truly hot).
+// Diagnostic call counters -- used by the offline micro-bench AND, via a bind(C) getter, by
+// FLASH's eos_pteDiag to report real per-cell op counts.
+//
+// OFF BY DEFAULT.  These are plain non-atomic global stores on the hottest path in the file
+// (g_evalRhoT increments on EVERY interpolation), which keeps evalRhoT_ from being a pure
+// function and costs a store per call for a number nobody reads in production.  Build with
+// -DSINGULARITY_RHOT_COUNTERS to get them back; the getter reports zeros when they are off,
+// which reads as "not measured" rather than "measured zero" because SG_RHOT_COUNTERS_ENABLED
+// is exposed alongside them.
+#ifdef SINGULARITY_RHOT_COUNTERS
+#define SG_RHOT_COUNT(which) (++::singularity::sg_rhot_acct::which)
+#define SG_RHOT_COUNTERS_ENABLED 1
+#else
+#define SG_RHOT_COUNT(which) ((void)0)
+#define SG_RHOT_COUNTERS_ENABLED 0
+#endif
+
+// Node-spacing classification of a loaded axis.  evalRhoT_ indexes both axes on every call, and
+// it can only do that in O(1) arithmetic when the nodes are evenly spaced -- in the value or in
+// its log.  Anything else needs a search.  The envelope tables shipped today are written on the
+// native SESAME nodes, which are evenly spaced in NEITHER, so this reports NONUNIFORM and the
+// search stands; regenerating the envelope on a uniform-log grid would unlock the O(1) path.
+//
+// Recorded per table at load and drained once by FLASH (eos_initSingularity) so the verdict is
+// printed on rank 0 next to the other EOS init lines, rather than by every rank from inside C++.
+namespace sg_rhot_grid {
+enum AxisKind { NONUNIFORM = 0, UNIFORM_LINEAR = 1, UNIFORM_LOG = 2 };
+struct Record {
+  int matid;
+  int rho_kind;
+  int t_kind;
+  int num_rho;
+  int num_t;
+};
+inline std::vector<Record> g_records;
+
+// Even spacing to a relative tolerance, judged against the mean step so a single ragged node is
+// not lost in an absolute threshold.  Requires all-positive values before taking logs.
+inline AxisKind classify(const double *v, int n, double rtol = 1.0e-6) {
+  if (n < 3) return UNIFORM_LINEAR; // two nodes are trivially evenly spaced
+  auto even = [&](bool in_log) {
+    if (in_log) {
+      for (int i = 0; i < n; ++i)
+        if (!(v[i] > 0.0)) return false;
+    }
+    const double first = in_log ? (std::log(v[1]) - std::log(v[0])) : (v[1] - v[0]);
+    if (!(std::abs(first) > 0.0)) return false;
+    for (int i = 1; i < n - 1; ++i) {
+      const double d = in_log ? (std::log(v[i + 1]) - std::log(v[i])) : (v[i + 1] - v[i]);
+      if (std::abs(d - first) > rtol * std::abs(first)) return false;
+    }
+    return true;
+  };
+  if (even(false)) return UNIFORM_LINEAR;
+  if (even(true)) return UNIFORM_LOG;
+  return NONUNIFORM;
+}
+} // namespace sg_rhot_grid
+
 namespace sg_rhot_acct {
 inline long g_evalRhoT = 0;      // fundamental (rho,T) interpolation
 inline long g_densityOfPT = 0;   // (P,T)->rho root (analytic or scan)
 inline long g_rootBisect = 0;    // flat-cell bisection fallbacks inside rootInCell
 inline long g_TfromE = 0;        // (rho,e)->T inversions (grid-search; fallback bisection)
 inline void reset() { g_evalRhoT = g_densityOfPT = g_rootBisect = g_TfromE = 0; }
+inline constexpr bool enabled() { return SG_RHOT_COUNTERS_ENABLED != 0; }
 }
 
 class TableDependsRhoT : public EosBase<TableDependsRhoT> {
@@ -129,7 +187,25 @@ class TableDependsRhoT : public EosBase<TableDependsRhoT> {
                                const SharedMemSettings &stngs = DEFAULT_SHMEM_STNGS) {
     char *base = (stngs.data == nullptr) ? src : stngs.data;
     sharedMemory_ = stngs.data;
-    return SpinerTricks::SetDynamicMemory(base, this);
+    const std::size_t n = SpinerTricks::SetDynamicMemory(base, this);
+    // EosBase::DeSerialize reaches here having done `memcpy(this, src, sizeof(CRTP))` -- a RAW
+    // byte copy of the whole object, std::vector members included. So these three headers still
+    // describe the SERIALIZING rank's heap: a pointer this rank never allocated, with size() and
+    // capacity() intact. Re-initialize them IN PLACE with placement-new; do NOT assign or
+    // resize, because either would first free a pointer we do not own.
+    //
+    // (memcpy-ing a non-trivially-copyable member is UB in the first place, but the wire format
+    // is upstream's and this is the containable fix.)
+    new (&mMono_) std::vector<int>();
+    new (&satT_) std::vector<double>();
+    new (&satPsat_) std::vector<double>();
+    // mMono_ and the axis kinds are DERIVED from the databoxes, which are valid again, so they
+    // are rebuilt exactly. satT_/satPsat_ are FILE data and cannot be -- they stay empty, which
+    // degrades gracefully to the dense-only root (the documented `empty()` behaviour). No table
+    // shipped today carries a /saturation group (checked across the whole V12_rhoT set), so
+    // nothing is lost in practice; a table that did would need them added to the wire format.
+    rebuildDerived_();
+    return n;
   }
 
   PORTABLE_INLINE_FUNCTION void CheckParams() const {
@@ -313,21 +389,60 @@ class TableDependsRhoT : public EosBase<TableDependsRhoT> {
   }
 
   // Cell index k with nodes[k] <= value <= nodes[k+1], clamped to [0, n-2] (like the sibling).
-  PORTABLE_INLINE_FUNCTION int cell_(const DataBox &nodes, int n, Real value) const {
-    int lo = 0, hi = n - 1;
-    while (hi - lo > 1) {
-      const int mid = (lo + hi) / 2;
-      if (nodes(mid) <= value)
-        lo = mid;
-      else
-        hi = mid;
+  //
+  // `kind`/`inv_step`/`log_min` come from the load-time axis classification (sg_rhot_grid): on an
+  // evenly spaced axis the index is arithmetic, otherwise this falls back to the bisection that
+  // was always here.  The arithmetic result is CORRECTED by at most a step in either direction so
+  // that round-off at a node boundary can never return a cell that does not bracket the value --
+  // the bracket, not the formula, is what rhoColumn_ relies on.
+  PORTABLE_INLINE_FUNCTION int cell_(const DataBox &nodes, int n, Real value, int kind = 0,
+                                     Real inv_step = 0.0, Real log_min = 0.0) const {
+    int lo;
+    if (kind == sg_rhot_grid::UNIFORM_LINEAR) {
+      lo = static_cast<int>(std::floor((value - nodes(0)) * inv_step));
+    } else if (kind == sg_rhot_grid::UNIFORM_LOG && value > 0.0) {
+      lo = static_cast<int>(std::floor((std::log(value) - log_min) * inv_step));
+    } else {
+      int a = 0, b = n - 1;
+      while (b - a > 1) {
+        const int mid = (a + b) / 2;
+        if (nodes(mid) <= value)
+          a = mid;
+        else
+          b = mid;
+      }
+      return std::min(std::max(a, 0), n - 2);
     }
-    return std::min(std::max(lo, 0), n - 2);
+    lo = std::min(std::max(lo, 0), n - 2);
+    while (lo > 0 && nodes(lo) > value) --lo;
+    while (lo < n - 2 && nodes(lo + 1) < value) ++lo;
+    return lo;
+  }
+
+  // Self-check for the O(1) index: compare it against the bisection at every node and midpoint,
+  // and demote `kind` to NONUNIFORM (so cell_ searches) if they ever disagree.  Called at load.
+  inline void rebuildDerived_();
+
+  inline void demoteAxisIfIndexDisagrees_(const DataBox &nodes, int n, int &kind, Real inv_step,
+                                          Real log_min) const {
+    if (kind == sg_rhot_grid::NONUNIFORM || n < 3) return;
+    for (int k = 0; k < n; ++k) {
+      Real probes[2] = {nodes(k), (k + 1 < n) ? 0.5 * (nodes(k) + nodes(k + 1)) : nodes(k)};
+      const int nprobe = (k + 1 < n) ? 2 : 1;
+      for (int q = 0; q < nprobe; ++q) {
+        const Real v = probes[q];
+        if (cell_(nodes, n, v, kind, inv_step, log_min) !=
+            cell_(nodes, n, v, sg_rhot_grid::NONUNIFORM)) {
+          kind = sg_rhot_grid::NONUNIFORM;
+          return;
+        }
+      }
+    }
   }
 
   // Linear-in-T weight and column index for temperature t (already clamped).
   PORTABLE_FORCEINLINE_FUNCTION void tWeight_(const Real t, int &j, Real &w) const {
-    j = cell_(T_, numT_, t);
+    j = cell_(T_, numT_, t, tAxisKind_, tInvStep_, logTMin_);
     const Real t_j = T_(j), t_jp = T_(j + 1);
     w = (t - t_j) / (t_jp - t_j);
   }
@@ -363,8 +478,9 @@ class TableDependsRhoT : public EosBase<TableDependsRhoT> {
   // outputs come from ONE interpolant, so they are mutually consistent.
   PORTABLE_INLINE_FUNCTION void evalRhoT_(Real rho, Real t, Real &P, Real &e, Real &dP_drho,
                                           Real &dP_dT, Real &de_drho, Real &de_dT) const {
-    ++sg_rhot_acct::g_evalRhoT;
-    const int i = cell_(rhoGrid_, numRho_, std::min(std::max(rho, rhoMin_), rhoMax_));
+    SG_RHOT_COUNT(g_evalRhoT);
+    const int i = cell_(rhoGrid_, numRho_, std::min(std::max(rho, rhoMin_), rhoMax_),
+                        rhoAxisKind_, rhoInvStep_, logRhoMin_);
     int j;
     Real w;
     tWeight_(clampT_(t), j, w);
@@ -439,6 +555,11 @@ class TableDependsRhoT : public EosBase<TableDependsRhoT> {
 #undef DBLIST
 
   int numRho_ = 0, numT_ = 0;
+  // Load-time axis classification (sg_rhot_grid::AxisKind) + the constants the O(1) index needs.
+  // Derived from the node arrays, so like mMono_ they are host-only and not serialized.
+  int rhoAxisKind_ = 0, tAxisKind_ = 0;
+  Real rhoInvStep_ = 0.0, logRhoMin_ = 0.0;
+  Real tInvStep_ = 0.0, logTMin_ = 0.0;
   Real Tmin_, Tmax_, rhoMin_, rhoMax_;
   Real normalDensity_ = 0.0;
   MeanAtomicProperties AZbar_;
@@ -453,9 +574,17 @@ class TableDependsRhoT : public EosBase<TableDependsRhoT> {
 // rectangular "dependsRhoT" layout this model reads: 1-D ascending node arrays `density`,
 // `temperature` and 2-D fields [numRho(slow), numT(fast)] `pressure`, `specific internal
 // energy`, `dPdRho`, `dPdT`, `dEdRho`, `dEdT`.  A matdata exporter
-// (pfc.sim.matdata: `write_rhot_depends_sp5`, the (rho,T) analogue of `write_inverted_pt_sp5`)
-// writes these from the SAME ConsistentEos the (P,T) table is built from, so the two agree
-// on the surface and only differ in index direction.  Units table-native (GPa, g/cm^3, MJ/kg).
+// (`pfc.sim.matdata._rhot_companion.write_depends_rhot_group`, called by default from
+// `export_rhot_companion`) writes these from the SAME free energy F the (P,T) table is built
+// from, so the two agree on the surface and only differ in index direction.
+//
+// Units are CGS throughout (g/cm^3, K, barye, erg/g) -- NOT the table-native GPa/MJ-per-kg an
+// earlier version of this comment claimed; verified against every shipped table, which also
+// carry the `unit_system = "cgs"` group attribute.
+//
+// `dPdRho` and `dEdRho` here are the CONSTANT-TEMPERATURE partials, the natural pairing for a
+// (rho,T) surface.  Do not assume the same for the identically named field under
+// `dependsLogRhoLogT`: that one is (dP/drho)_E, at constant ENERGY.
 
 inline TableDependsRhoT::TableDependsRhoT(const std::string &filename, int matid)
     : matid_(matid), memoryStatus_(DataStatus::OnHost) {
@@ -481,6 +610,60 @@ inline TableDependsRhoT::TableDependsRhoT(const std::string &filename,
   loadTable_(std::to_string(matid_), file);
   spiner_common::h5_safe_fclose(file);
   CheckParams();
+}
+
+// Recompute everything derived from the node arrays / P_ rather than read from the file.
+//
+// MUST be called both at load AND after any deserialization that repoints the databoxes.
+// `mMono_` is a std::vector<int>, deliberately NOT in DBLIST (it is derived, not table data), so
+// the serialize -> DeSerialize round trip the MPI shared-memory path performs reconstructs an
+// object whose mMono_ header still refers to the SERIALIZING rank's heap. It is non-empty, so
+// the `!mMono_.empty()` guard in densityOfPT_ passes and `mMono_[j]` then reads freed memory --
+// a segfault on the first (P,T) root, on every rank, independent of the (P,T) values. That is
+// exactly the RUN023/RUN026 crash: only densityOfPT_ touches mMono_, so the DALTON closure
+// (evalRhoT_ only) survived the same tables, and single-process offline probes never round trip
+// and so never reproduced it.
+//
+// The axis-kind scalars are rebuilt here too. They would not segfault, but after a round trip
+// they are not guaranteed to correspond to the deserialized grids, and a wrong cell index
+// silently interpolates in the wrong interval -- worse than a crash.
+inline void TableDependsRhoT::rebuildDerived_() {
+  // Top monotone-increasing run start per T-column: smallest m with P(k+1,j) > P(k,j) for all
+  // k in [m, numRho_-2].  A localized density scan starting at k+1 >= m (on the high-P side)
+  // cannot skip a denser increasing crossing, so it matches the full dense-end scan exactly.
+  mMono_.resize(numT_);
+  for (int j = 0; j < numT_; ++j) {
+    int m = numRho_ - 1;
+    while (m - 1 >= 0 && P_(m, j) > P_(m - 1, j)) --m;
+    mMono_[j] = m;
+  }
+
+  // Axis spacing -> whether cell_() can index in O(1) or has to search.  See sg_rhot_grid.
+  rhoAxisKind_ = sg_rhot_grid::classify(rhoGrid_.data(), numRho_);
+  tAxisKind_ = sg_rhot_grid::classify(T_.data(), numT_);
+  if (rhoAxisKind_ == sg_rhot_grid::UNIFORM_LINEAR) {
+    rhoInvStep_ = (numRho_ - 1) / (rhoGrid_(numRho_ - 1) - rhoGrid_(0));
+  } else if (rhoAxisKind_ == sg_rhot_grid::UNIFORM_LOG) {
+    logRhoMin_ = std::log(rhoGrid_(0));
+    rhoInvStep_ = (numRho_ - 1) / (std::log(rhoGrid_(numRho_ - 1)) - logRhoMin_);
+  }
+  if (tAxisKind_ == sg_rhot_grid::UNIFORM_LINEAR) {
+    tInvStep_ = (numT_ - 1) / (T_(numT_ - 1) - T_(0));
+  } else if (tAxisKind_ == sg_rhot_grid::UNIFORM_LOG) {
+    logTMin_ = std::log(T_(0));
+    tInvStep_ = (numT_ - 1) / (std::log(T_(numT_ - 1)) - logTMin_);
+  }
+
+  // Prove the arithmetic index before trusting it.  No table shipped today is evenly spaced, so
+  // the O(1) branch would otherwise go into production having never executed on real data; and a
+  // wrong cell index is not a small error, it silently interpolates in the wrong interval.  Walk
+  // every node and every midpoint, demand the fast index reproduce the bisection exactly, and
+  // demote the axis to NONUNIFORM on any disagreement.  Load-time only.
+  demoteAxisIfIndexDisagrees_(rhoGrid_, numRho_, rhoAxisKind_, rhoInvStep_, logRhoMin_);
+  demoteAxisIfIndexDisagrees_(T_, numT_, tAxisKind_, tInvStep_, logTMin_);
+
+  demoteAxisIfIndexDisagrees_(rhoGrid_, numRho_, rhoAxisKind_, rhoInvStep_, logRhoMin_);
+  demoteAxisIfIndexDisagrees_(T_, numT_, tAxisKind_, tInvStep_, logTMin_);
 }
 
 inline herr_t TableDependsRhoT::loadTable_(const std::string &matid_str, hid_t file) {
@@ -519,15 +702,9 @@ inline herr_t TableDependsRhoT::loadTable_(const std::string &matid_str, hid_t f
   Tmin_ = T_(0);
   Tmax_ = T_(numT_ - 1);
 
-  // Top monotone-increasing run start per T-column: smallest m with P(k+1,j) > P(k,j) for all
-  // k in [m, numRho_-2].  A localized density scan starting at k+1 >= m (on the high-P side)
-  // cannot skip a denser increasing crossing, so it matches the full dense-end scan exactly.
-  mMono_.resize(numT_);
-  for (int j = 0; j < numT_; ++j) {
-    int m = numRho_ - 1;
-    while (m - 1 >= 0 && P_(m, j) > P_(m - 1, j)) --m;
-    mMono_[j] = m;
-  }
+  rebuildDerived_();
+
+  sg_rhot_grid::g_records.push_back({matid_, rhoAxisKind_, tAxisKind_, numRho_, numT_});
 
   // Optional L-V dome for branch-aware (P,T)->rho: root /saturation/vapor_liquid/{temperature,
   // p_sat}. Absent => satT_/satPsat_ stay empty => dense-only root (backward-compatible). p_sat
@@ -570,7 +747,7 @@ inline herr_t TableDependsRhoT::loadTable_(const std::string &matid_str, hid_t f
 // interval where P(rho;T) crosses `press` while INCREASING (P_rho>0) -- the condensed branch.
 // Off-branch queries clamp to the nearer grid end.  (Port of RhoTPteEos._density_at.)
 PORTABLE_INLINE_FUNCTION Real TableDependsRhoT::densityOfPT_(Real press, Real temp) const {
-  ++sg_rhot_acct::g_densityOfPT;
+  SG_RHOT_COUNT(g_densityOfPT);
   const Real t = clampT_(temp);
   int j;
   Real w;
@@ -590,7 +767,7 @@ PORTABLE_INLINE_FUNCTION Real TableDependsRhoT::densityOfPT_(Real press, Real te
       const Real wr = (press - pa) / denom;
       return rhoGrid_(k) + wr * (rhoGrid_(k + 1) - rhoGrid_(k));
     }
-    ++sg_rhot_acct::g_rootBisect;
+    SG_RHOT_COUNT(g_rootBisect);
     Real rlo = rhoGrid_(k), rhi = rhoGrid_(k + 1); // flat cell: robust sign-based bisection
     for (int it = 0; it < 100; ++it) {
       const Real rm = 0.5 * (rlo + rhi);
@@ -732,7 +909,7 @@ PORTABLE_INLINE_FUNCTION Real TableDependsRhoT::BulkModulusFromDensityTemperatur
 template <typename Indexer_t>
 PORTABLE_INLINE_FUNCTION Real TableDependsRhoT::TemperatureFromDensityInternalEnergy(
     const Real rho, const Real sie, Indexer_t &&lambda) const {
-  ++sg_rhot_acct::g_TfromE;
+  SG_RHOT_COUNT(g_TfromE);
   const Real r = std::min(std::max(rho, rhoMin_), rhoMax_);
   Real tlo = Tmin_, thi = Tmax_;
   for (int it = 0; it < 100; ++it) {

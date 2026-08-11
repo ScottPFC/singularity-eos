@@ -249,8 +249,34 @@ PTESolveCyclicRhoE(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_to
     mix(P, T, tau_now, e_now);
     const Real tau_err = std::abs(tau_now - tau_target) / tau_target;
     const Real e_err = std::abs(e_now - sie_tot) / (1.0 + std::abs(sie_tot));
-    const Real sub_tol =
-        std::min(std::max(1.0e-3 * std::max(tau_err, e_err), 1.0e-14), 1.0e-3);
+    // The FLOOR is the dominant cost knob, not the 1e-3 factor.  LogBracketRoot halves the LOG
+    // bracket per evaluation, so a bracket spanning D decades costs log2(ln(10^D)/ln(1+tol))
+    // evaluations: over the ~22-decade pressure bracket that is ~16 at 1e-3, ~32 at 1e-8 and ~52
+    // at 1e-14.  Cost therefore GROWS as the outer solve converges and the floor takes over --
+    // which is backwards, since the comment on LogBracketRoot is right that step 3's tangent
+    // supersedes this answer and the sub-solve only has to AIM it.
+    //
+    // MEASURED, AND THE FLOOR IS NOT THE LEVER (bench_pte_solve, CyclicRhoEStep, 20000 cells):
+    //   floor  1e-14 -> 250.7 roots/cell, 48.8 us, 19988 converged   (current)
+    //          1e-10 -> 250.7             48.9     19988
+    //          1e-8  -> 247.1             48.2     19988
+    //          1e-6  -> 229.9             45.1     19987
+    // Only -8% at 1e-6.  The floor binds only where 1e-3*err < floor, i.e. err < 1e-11, which is
+    // the LAST outer iteration -- and the outer loop runs ~1.5 iterations, so it barely fires.
+    // The cost sits at the COARSE end (sub_tol capped at 1e-3, ~16 evaluations per bracket) and
+    // is therefore set by bisection's one-bit-per-evaluation RATE, not by the tolerance.  Making
+    // it cheaper means a superlinear bracketed method (Illinois/Ridders) at the SAME stopping
+    // width -- which is the change ca038da4b reverted, on the grounds that the sub-solve's
+    // coarseness was acting as DAMPING on the outer iteration.  Measure outer iterations and the
+    // converged count, not just wall time, before believing any replacement.
+    //
+    // Kept as a build knob because raising it is the one direction that is safe by construction
+    // (coarser, never sharper); the default is unchanged.
+#ifndef SG_PTE_RHOE_SUBTOL_FLOOR
+#define SG_PTE_RHOE_SUBTOL_FLOOR 1.0e-14
+#endif
+    const Real sub_tol = std::min(
+        std::max(1.0e-3 * std::max(tau_err, e_err), Real(SG_PTE_RHOE_SUBTOL_FLOOR)), 1.0e-3);
 
     // Step 1: isochoric sub-solve for P~ at fixed T^n.
     Real p_tilde = P;
