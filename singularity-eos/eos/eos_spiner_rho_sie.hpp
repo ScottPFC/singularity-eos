@@ -446,6 +446,32 @@ herr_t SpinerEOSDependsRhoSieTransformable<TransformerT>::loadDataboxes_(
                                                &lTOffset_);
   spiner_common::h5_safe_get_attribute<double>(file, matid_str.c_str(), SP5::Offsets::sie,
                                                &lEOffset_);
+
+  // ---- Per-split sie offset ----
+  // The material-level sieOffset is sized from the ION minimum (compute_offset returns
+  // 1.1*|min| for negative data, ~1.86e9 for Al).  Electron energies are strictly POSITIVE
+  // (Al min +684.9), so an electron axis stored against the ion's offset spends 15.8% of its
+  // nodes on negative energies AND leaves the entire cold electron branch unresolved: on the
+  // V21 Al table the nodes bracketing +684.9 are -3.556e7 and +6.287e6, so everything from
+  // 685 to 6.3e6 erg/g falls inside ONE interval.
+  //
+  // A split may therefore carry its own `sieOffset` on its dependsLogRhoLogSie group (0 for
+  // electrons, since compute_offset returns 0 for positive data).  Prefer it when present.
+  // Existing tables have no such attribute, so they fall back to the material-level value and
+  // load bit-identically -- this is backward compatible in both directions.
+  {
+    // MUST test existence first.  `optional=true` only suppresses singularity's OWN error --
+    // the constructor installs spiner_common::aborting_error_handler via H5Eset_auto, so the
+    // underlying H5LTget_attribute_double still ABORTS on a missing attribute.  Reading
+    // optimistically here killed every pre-existing table (verified against V21).
+    if (H5Aexists_by_name(lEGroup, ".", SP5::Offsets::sie, H5P_DEFAULT) > 0) {
+      double split_offset = 0.0;
+      spiner_common::h5_safe_get_attribute<double>(lEGroup, ".", SP5::Offsets::sie,
+                                                   &split_offset);
+      lEOffset_ = split_offset;
+    }
+  }
+
   lRhoOffset_ = std::abs(lRhoOffset_);
   lTOffset_ = std::abs(lTOffset_);
   lEOffset_ = std::abs(lEOffset_);
@@ -516,6 +542,32 @@ herr_t SpinerEOSDependsRhoSieTransformable<TransformerT>::loadDataboxes_(
   lRhoMin_ = sie_.range(1).min();
   lRhoMax_ = sie_.range(1).max();
   rhoMax_ = from_log(lRhoMax_, lRhoOffset_);
+
+  // ---- Split-consistent cold curve (mirrors eos_spiner_rho_temp.hpp) ----
+  // PCold_/sieCold_/bModCold_/dPdRhoCold_ come from the material's SHARED `coldCurve` group.
+  // Only lTGroupName/lEGroupName carry the /electronOnly or /ionCold suffix, so a split table
+  // was left holding the TOTAL (ion + electron) cold curve.  For an ElectronOnly split that
+  // makes MinInternalEnergyFromDensity return an ion-magnitude bound (Al: -1.7e9 where the
+  // electron minimum is +684.9) -- precisely the quantity an admissibility check would trust.
+  //
+  // `sie_` is this split's OWN (rho,T) energy databox (loaded from lTGroup above), so its
+  // bottom row is the split-consistent minimum, exactly as in the (rho,T) class.
+  //
+  // NB with the default NullTransform -- what FLASH instantiates -- sieCold_ does NOT enter
+  // TransformDataContainer_'s arithmetic (NullTransform::transform returns e unchanged), so
+  // this cannot perturb the energy coordinate.  It only corrects the bound.  PCold_/bModCold_/
+  // dPdRhoCold_ are currently never READ in this class; they are set anyway so the object is
+  // self-consistent if a consumer starts using them.  Total keeps the file's curve.
+  if (split_ != TableSplit::Total) {
+    const Real lTMinSplit = sie_.range(0).min();
+    for (int j = 0; j < numRho_; j++) {
+      const Real lRho = sieCold_.range(0).x(j);
+      sieCold_(j) = sie_.interpToReal(lRho, lTMinSplit);
+      PCold_(j) = dependsRhoT_.P.interpToReal(lRho, lTMinSplit);
+      bModCold_(j) = dependsRhoT_.bMod.interpToReal(lRho, lTMinSplit);
+      dPdRhoCold_(j) = dependsRhoT_.dPdRho.interpToReal(lRho, lTMinSplit);
+    }
+  }
 
   // slice to maximum of rho
   PlRhoMax_ = dependsRhoT_.P.slice(numRho_ - 1);
