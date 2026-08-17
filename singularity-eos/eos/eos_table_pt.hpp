@@ -39,6 +39,38 @@
 // systems at the boundary (all materials in a mixture share the same units, so the closure
 // is unit-system-agnostic internally). TODO(pte): plumb an explicit unit-system conversion.
 
+// =============================================================================
+// PT-TABLE ACCESSOR ACCOUNTING
+//
+// This table advertises DensityEnergyFromPressureTemperature as a direct O(1) interpolation, and
+// it is. But three of its OTHER entry points are bisections, and one of them NESTS:
+//
+//   pressureOfRhoT_                     : up to 100 iterations (invert rho(P;T) for P)
+//   TemperatureFromDensityInternalEnergy: up to 100 iterations, EACH calling pressureOfRhoT_
+//                                         -> up to 10,000 interpolations, ~600 us per call
+//
+// A cell that touches the nested one costs three orders of magnitude more than one that stays on
+// the direct path, which is invisible in any per-cell wall number and was mistaken in this
+// workstream for page faults, a diagnostic write, and a warm-start re-solve in turn. These
+// counters make the distinction measurable: divide by the PTE call count to get accessor calls
+// per cell, and the nested counter alone explains a millisecond.
+//
+// Always on: one non-atomic increment against work that is 100 to 10,000 interpolations is not
+// measurable, and the alternative is a build flag nobody sets when the question arises.
+// =============================================================================
+// Function-local statics, not extern globals: this header is included by many translation units
+// (the pyFlash4 modules among them) and an `extern` declaration makes every one of them reference
+// a symbol only the interface TU defines -- which links fine for FLASH itself and fails for the
+// Python bindings. A function-local static gives one definition per program with no defining TU.
+namespace sg_pt_acct {
+inline unsigned long long &directPT() { static unsigned long long v = 0; return v; }
+inline unsigned long long &derivPT() { static unsigned long long v = 0; return v; }
+inline unsigned long long &pressRhoT() { static unsigned long long v = 0; return v; }
+inline unsigned long long &pressIters() { static unsigned long long v = 0; return v; }
+inline unsigned long long &tempRhoE() { static unsigned long long v = 0; return v; }
+inline unsigned long long &tempIters() { static unsigned long long v = 0; return v; }
+} // namespace sg_pt_acct
+
 #ifdef SINGULARITY_USE_PT_TABLES
 #ifndef SINGULARITY_USE_SPINER_WITH_HDF5
 #error "SINGULARITY_USE_PT_TABLES requires SINGULARITY_USE_SPINER_WITH_HDF5"
@@ -314,7 +346,9 @@ class TableDependsPT : public EosBase<TableDependsPT> {
     const Real rlo = rhoOfPT_(plo, temp), rhi = rhoOfPT_(phi, temp);
     if (rho_target <= rlo) return plo;
     if (rho_target >= rhi) return phi;
+    ++sg_pt_acct::pressRhoT();
     for (int it = 0; it < 100; ++it) {
+      ++sg_pt_acct::pressIters();
       const Real pm = 0.5 * (plo + phi);
       const Real rm = rhoOfPT_(pm, temp);
       if (rm < rho_target)
@@ -435,6 +469,7 @@ inline herr_t TableDependsPT::loadTable_(const std::string &matid_str, hid_t fil
 template <typename Indexer_t>
 PORTABLE_INLINE_FUNCTION void TableDependsPT::DensityEnergyFromPressureTemperature(
     const Real press, const Real temp, Indexer_t &&, Real &rho, Real &sie) const {
+  ++sg_pt_acct::directPT();
   const Real p = std::min(std::max(press, Pmin_), Pmax_);
   const Real t = std::min(std::max(temp, Tmin_), Tmax_);
   const int i = cell_(P_, numP_, p);
@@ -540,6 +575,7 @@ template <typename Indexer_t>
 PORTABLE_INLINE_FUNCTION Real TableDependsPT::TemperatureFromDensityInternalEnergy(
     const Real rho, const Real sie, Indexer_t &&) const {
   // Invert e(rho, T) for T by bisection: at fixed T, P is set by rho, then e follows.
+  ++sg_pt_acct::tempRhoE();
   Real tlo = Tmin_, thi = Tmax_;
   auto e_of_t = [&](Real tt) {
     const Real pp = pressureOfRhoT_(rho, tt);
@@ -551,6 +587,7 @@ PORTABLE_INLINE_FUNCTION Real TableDependsPT::TemperatureFromDensityInternalEner
   if (sie <= elo) return tlo;
   if (sie >= ehi) return thi;
   for (int it = 0; it < 100; ++it) {
+    ++sg_pt_acct::tempIters();
     const Real tm = 0.5 * (tlo + thi);
     if (e_of_t(tm) < sie)
       tlo = tm;
