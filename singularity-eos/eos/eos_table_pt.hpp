@@ -77,6 +77,7 @@ inline unsigned long long &tempIters() { static unsigned long long v = 0; return
 #endif
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -341,23 +342,44 @@ class TableDependsPT : public EosBase<TableDependsPT> {
   }
 
   // Invert the monotone rho(P;T) for P at fixed T by bisection on [Pmin_, Pmax_].
+  //
+  // GEOMETRIC, not arithmetic. [Pmin_, Pmax_] spans ~20 decades and the convergence test is
+  // RELATIVE, so halving the LINEAR interval is badly matched to the problem: resolving a
+  // pressure near Pmin_ out of a 1e20-wide range to a 1e-12 relative tolerance takes ~93
+  // iterations, and it is worst for exactly the cold low-pressure cells that dominate the
+  // cold-phase tail. Measured before this change: 5,719,421 calls averaging 71 ITERATIONS each --
+  // 405 million interpolations, ~40% of the entire PTE branch's table traffic (RUN305).
+  //
+  // Halving the LOG interval matches the relative test: ~45 iterations covers the same 20 decades
+  // to the same relative precision, independent of where the root sits. The sibling LogBracketRoot
+  // in pte_cyclic_rhoe.hpp already does exactly this; this routine simply predates it.
+  //
+  // Falls back to arithmetic if either bound is non-positive, where the geometric mean is
+  // undefined.
   PORTABLE_INLINE_FUNCTION Real pressureOfRhoT_(Real rho_target, Real temp) const {
     Real plo = Pmin_, phi = Pmax_;
     const Real rlo = rhoOfPT_(plo, temp), rhi = rhoOfPT_(phi, temp);
     if (rho_target <= rlo) return plo;
     if (rho_target >= rhi) return phi;
     ++sg_pt_acct::pressRhoT();
+    const bool geometric = (plo > 0.0 && phi > 0.0);
     for (int it = 0; it < 100; ++it) {
       ++sg_pt_acct::pressIters();
-      const Real pm = 0.5 * (plo + phi);
+      const Real pm = geometric ? std::sqrt(plo * phi) : 0.5 * (plo + phi);
       const Real rm = rhoOfPT_(pm, temp);
       if (rm < rho_target)
         plo = pm;
       else
         phi = pm;
-      if ((phi - plo) <= PRESSURE_ROOT_TOL_ * (std::abs(pm) + PRESSURE_ROOT_TOL_)) break;
+      // Relative bracket test in the same measure the step uses, so the iteration count no longer
+      // depends on where in the 20 decades the root happens to lie.
+      if (geometric) {
+        if (phi <= plo * (1.0 + PRESSURE_ROOT_TOL_)) break;
+      } else if ((phi - plo) <= PRESSURE_ROOT_TOL_ * (std::abs(pm) + PRESSURE_ROOT_TOL_)) {
+        break;
+      }
     }
-    return 0.5 * (plo + phi);
+    return geometric ? std::sqrt(plo * phi) : 0.5 * (plo + phi);
   }
 
   static constexpr Real INCOMPRESSIBLE_REL_TOL_ = 1.0e-12; // matches _pte_table.py
