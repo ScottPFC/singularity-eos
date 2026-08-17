@@ -380,6 +380,89 @@ PTESolveCyclicRhoE(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_to
     residual = residual_new;
   }
 
+  // ---- LAST-RESORT RESCUE: MINIMISE the residual where the brackets cannot ROOT it ----
+  //
+  // Reached ONLY after the loop above has stopped improving without converging, so a converging
+  // cell never evaluates any of this and its answer is bit-identical.
+  //
+  // WHY A MINIMISER AND NOT A BETTER ROOT FIND.  Both sub-solves are BRACKETED, and a bracket
+  // needs a SIGN CHANGE.  On a cold mixed cell the mixture energy along the tau-closing curve
+  // can be NON-MONOTONE in T, dipping to a minimum that lies a hair BELOW the target -- measured
+  // on a RUN252 Cu/DD/TT cell (rho 0.50138, sie_tot -1.9466e9 erg/g, table frame) the minimum
+  // sits 8.56e3 erg/g below target, 4.4e-6 relative:
+  //
+  //     T (K)      0.01        0.5         1.0          2.0         5.0
+  //     sie     -1.9398e9  -1.9440e9  -1.9466e9    -1.9173e9   -1.7741e9
+  //     gap     +6.82e+06  +2.60e+06  -8.56e+03    +2.93e+07   +1.73e+08
+  //
+  // So the energy residual is very nearly TANGENT to zero, with two roots almost coincident, and
+  // there is no sign change for LogBracketRoot to find.  The no-bracket Newton fallback then
+  // measures a ~0 slope at that minimum and does not move: MEASURED, sweeping the seed over
+  // 1..2000 K, T came back EQUAL to its seed in all ten cases with the residual stuck at 3.4e-3.
+  //
+  // A minimiser needs only unimodality, not a sign change, so the tangency cannot defeat it.
+  // MEASURED on that state, identical on the V14 and V17 table sets: residual 2.23e-16 against a
+  // 1e-6 bar, tau to 2.2e-16 and sie to 0.0 relative, at T = 0.998 K.
+  //
+  // NOTE the state has TWO genuine PTE roots -- PTESolverPTCyclic reaches T = 0.9979 from a 1 K
+  // seed and T = 1.3906 from 75 K, both to ~1e-13.  This lands on the lower one.  That
+  // non-uniqueness is a property of the state, not of the method.
+#ifndef SG_PTE_RHOE_MINIMISER_RESCUE
+#define SG_PTE_RHOE_MINIMISER_RESCUE 1
+#endif
+#ifndef SG_PTE_RHOE_RESCUE_ITERS
+#define SG_PTE_RHOE_RESCUE_ITERS 60
+#endif
+  if (SG_PTE_RHOE_MINIMISER_RESCUE && !(std::isfinite(residual) && residual <= tol)) {
+    // tau is monotone in P, so unlike the energy bracket this one cannot fail to find its root.
+    const auto close_tau = [&](const Real T_at) {
+      Real lo = p_lo_bracket, hi = p_hi, tau, energy;
+      for (int i = 0; i < 64; ++i) {
+        const Real pm = std::sqrt(lo * hi);
+        mix(pm, T_at, tau, energy);
+        if (!std::isfinite(tau)) {
+          hi = pm;
+          continue;
+        }
+        if (tau > tau_target) lo = pm;
+        else hi = pm;
+        if (hi <= lo * (1.0 + 1.0e-13)) break;
+      }
+      return std::sqrt(lo * hi);
+    };
+    // Reuse the SAME residual the loop above judges itself by, so "improved" means one thing.
+    const auto f_of_t = [&](const Real T_at) { return residual_of(close_tau(T_at), T_at); };
+
+    const Real gr = 0.6180339887498949; // (sqrt(5) - 1) / 2
+    Real a = std::log(t_lo_bracket), b = std::log(t_hi);
+    Real c = b - gr * (b - a), d = a + gr * (b - a);
+    Real fc = f_of_t(std::exp(c)), fd = f_of_t(std::exp(d));
+    for (int i = 0; i < SG_PTE_RHOE_RESCUE_ITERS && (b - a) > 1.0e-12; ++i) {
+      if (fc < fd) {
+        b = d;
+        d = c;
+        fd = fc;
+        c = b - gr * (b - a);
+        fc = f_of_t(std::exp(c));
+      } else {
+        a = c;
+        c = d;
+        fc = fd;
+        d = a + gr * (b - a);
+        fd = f_of_t(std::exp(d));
+      }
+    }
+    const Real t_star = std::exp(0.5 * (a + b));
+    const Real p_star = close_tau(t_star);
+    const Real r_star = residual_of(p_star, t_star);
+    // Accept only an improvement: the rescue must never leave a cell worse than the loop did.
+    if (std::isfinite(r_star) && r_star < residual) {
+      P = p_star;
+      T = t_star;
+      residual = r_star;
+    }
+  }
+
   status.residual = residual;
   status.max_niter = iters;
   status.converged = std::isfinite(residual) && residual <= tol;

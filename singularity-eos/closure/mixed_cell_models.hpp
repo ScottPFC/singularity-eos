@@ -104,6 +104,10 @@ struct SolverStatus {
   std::size_t small_step_iters = 0;
   std::size_t stagnation_iters = 0;
   std::size_t pressure_jump_attempts = 0;
+  // Iterations that fell back to a bracketed coordinate step because a Newton step could not
+  // contract the residual (PTESolveDual only).  Zero means the solve ran at pure-Newton cost, so
+  // this is the diagnostic that says whether a cell needed the safeguard at all.
+  std::size_t safeguard_iters = 0;
   Real residual;
 };
 
