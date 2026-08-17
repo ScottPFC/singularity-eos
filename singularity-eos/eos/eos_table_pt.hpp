@@ -69,6 +69,14 @@ inline unsigned long long &pressRhoT() { static unsigned long long v = 0; return
 inline unsigned long long &pressIters() { static unsigned long long v = 0; return v; }
 inline unsigned long long &tempRhoE() { static unsigned long long v = 0; return v; }
 inline unsigned long long &tempIters() { static unsigned long long v = 0; return v; }
+// PER-CALLER: which (rho,T) entry point drives pressureOfRhoT_. All four bisect, and the routing
+// audit showed FLASH's call sites already use the (rho,T) companion -- so ~5 entries per PTE cell
+// are arriving from somewhere these counters can name, rather than from a mis-routed call site.
+inline unsigned long long &fromPressRhoT() { static unsigned long long v = 0; return v; }
+inline unsigned long long &fromEnergyRhoT() { static unsigned long long v = 0; return v; }
+inline unsigned long long &fromCvRhoT() { static unsigned long long v = 0; return v; }
+inline unsigned long long &fromBmodRhoT() { static unsigned long long v = 0; return v; }
+inline unsigned long long &fromOther() { static unsigned long long v = 0; return v; }
 } // namespace sg_pt_acct
 
 #ifdef SINGULARITY_USE_PT_TABLES
@@ -568,12 +576,14 @@ TableDependsPT::DensityEnergyDerivativesFromPressureTemperature(
 template <typename Indexer_t>
 PORTABLE_INLINE_FUNCTION Real TableDependsPT::PressureFromDensityTemperature(
     const Real rho, const Real temperature, Indexer_t &&) const {
+  ++sg_pt_acct::fromPressRhoT();
   return pressureOfRhoT_(rho, std::min(std::max(temperature, Tmin_), Tmax_));
 }
 
 template <typename Indexer_t>
 PORTABLE_INLINE_FUNCTION Real TableDependsPT::InternalEnergyFromDensityTemperature(
     const Real rho, const Real temperature, Indexer_t &&lambda) const {
+  ++sg_pt_acct::fromEnergyRhoT();
   const Real t = std::min(std::max(temperature, Tmin_), Tmax_);
   const Real p = pressureOfRhoT_(rho, t);
   Real r, sie;
@@ -584,6 +594,7 @@ PORTABLE_INLINE_FUNCTION Real TableDependsPT::InternalEnergyFromDensityTemperatu
 template <typename Indexer_t>
 PORTABLE_INLINE_FUNCTION Real TableDependsPT::SpecificHeatFromDensityTemperature(
     const Real rho, const Real temperature, Indexer_t &&) const {
+  ++sg_pt_acct::fromCvRhoT();
   // Cv ~ (de/dT)_P near the (P,T) node (the table's stored analytic (de/dT)_P). This is
   // c_p, not c_v, strictly; the PT closure uses it only as a warm-start heat scale.
   const Real t = std::min(std::max(temperature, Tmin_), Tmax_);
@@ -637,6 +648,7 @@ PORTABLE_INLINE_FUNCTION Real TableDependsPT::SpecificHeatFromDensityInternalEne
 template <typename Indexer_t>
 PORTABLE_INLINE_FUNCTION Real TableDependsPT::BulkModulusFromDensityTemperature(
     const Real rho, const Real temperature, Indexer_t &&) const {
+  ++sg_pt_acct::fromBmodRhoT();
   // K_T = rho (dP/drho)_T = rho / (drho/dP)_T, from the stored analytic partial.
   const Real t = std::min(std::max(temperature, Tmin_), Tmax_);
   const Real p = pressureOfRhoT_(rho, t);
