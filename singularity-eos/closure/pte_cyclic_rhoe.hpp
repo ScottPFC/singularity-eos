@@ -82,38 +82,142 @@ PORTABLE_INLINE_FUNCTION void MixtureTauE(const std::size_t nmat, EOSIndexer &eo
   }
 }
 
-// Bracketed root of a monotone residual on [lo, hi] by bisection in log space.  False when the
-// endpoints do not straddle zero, so the caller keeps its current iterate rather than stepping
+// Bracketed root of a monotone residual on [lo, hi] by BRENT's method in log space.  False when
+// the endpoints do not straddle zero, so the caller keeps its current iterate rather than stepping
 // outside the table.
 //
 // `rel_tol` is the bracket width ratio to stop at.  Resolving to machine precision is waste: the
 // tangent intersection in step 3 supersedes this answer, so the sub-solve only has to aim it.
-// Bisection halves the log bracket per evaluation, so each decade of tolerance is ~3.3 evaluations
-// and the brackets are essentially the entire cost of the method -- measured on the RUN102
-// interface cell in the Python twin, tying the tolerance to the residual cut EOS evaluations per
-// solve 3023 -> 1591 (-47%) at unchanged 100% seed robustness.
+// These brackets are essentially the entire cost of the method -- measured on the RUN102 interface
+// cell in the Python twin, tying the tolerance to the residual cut EOS evaluations per solve
+// 3023 -> 1591 (-47%) at unchanged 100% seed robustness.
+//
+// The METHOD is the other half of that cost, and it was left on the table until now.  Plain
+// bisection buys exactly one bit per evaluation, so ~20 decades down to a 1e-12 floor costs ~46
+// evaluations of an nmat-material mixture.  Brent interpolates, but takes the interpolated point
+// ONLY when it lands well inside the bracket and at least halves the step, and bisects otherwise:
+// the width still falls like bisection's in the worst case, so the bracket invariant and the
+// robustness that rests on it are unchanged BY CONSTRUCTION, not by measurement.
+//
+// Measured against the bisection it replaces, same rel_tol, same stopping rule, on the 44 hardest
+// captured cells (RUN305, the 100 us - 1 ms band):
+//
+//     evaluations per sub-solve   48 -> 12   (-75%)
+//     total EOS evals, dual arm   9537 -> 5127   (-46%)
+//     converged                   44/44 -> 44/44
+//     seed basin (24x24, RUN102)  569/576 -> 569/576, the IDENTICAL SET
+//     roots agree to 3.8e-13 at rel_tol 1e-12; solved (P,T) to 5e-10 at a 1e-6 solver tolerance
+//
+// Two earlier attempts to accelerate this measured WORSE, and neither kept a safeguard: a seeded
+// Newton step collapsed the stale-seed basin (17070/20000 -> 209/20000) by leaving the bracket,
+// and a Dekker secant cost 26% MORE evaluations because a secant shrinks one side only while the
+// termination test is a bracket WIDTH ratio.  Brent's forced bisection is exactly what those
+// lacked.
+//
+// The reported bracket is PHYSICS, not diagnostics -- see BracketReport in
+// pte_cyclic_rhoe_lever.hpp.  On a coexistence jump the residual is discontinuous, which is
+// precisely the case interpolation cannot shrink, so the safeguard bisects and the bracket still
+// collapses onto the jump with its two branch values at the ends.  Verified on a step residual
+// with a known jump: location to 5e-13 and the jump recovered EXACTLY, matching bisection.
+//
+// Keep this in lockstep with the Python twin, `_pte.py::_bracketed_log_root_report`.  A twin using
+// a different root finder cannot score this solver's cost -- loosening rel_tol saves ~50% of a
+// bisecting solver's evaluations and only 7% of an interpolating one's.
+template <typename Residual>
+PORTABLE_INLINE_FUNCTION bool LogBracketRootCore(const Real lo_in, const Real hi_in,
+                                                 const Residual &resid, const Real rel_tol,
+                                                 Real &root, Real &lo_out, Real &hi_out,
+                                                 Real &f_lo_out, Real &f_hi_out) {
+  lo_out = lo_in;
+  hi_out = hi_in;
+  if (!(hi_in > lo_in && lo_in > 0.0)) return false;
+  const Real f_lo = resid(lo_in);
+  const Real f_hi = resid(hi_in);
+  f_lo_out = f_lo;
+  f_hi_out = f_hi;
+  if (!std::isfinite(f_lo) || !std::isfinite(f_hi)) return false;
+  if (f_lo == 0.0) { root = lo_in; return true; }
+  if (f_hi == 0.0) { root = hi_in; return true; }
+  if (f_lo * f_hi > 0.0) return false;
+
+  // Brent in u = ln(x), so the width test is hi/lo < 1 + rel_tol exactly as the bisection twin's,
+  // and b and c always straddle the root.
+  Real b = std::log(lo_in), c = std::log(hi_in);
+  Real f_b = f_lo, f_c = f_hi;
+  Real a = b, f_a = f_b;
+  const Real tol_u = std::log1p(rel_tol);
+  Real step = c - b, prev_step = step;
+  for (int it = 0; it < 200; ++it) {
+    if ((f_b > 0.0) == (f_c > 0.0)) { // c stopped bracketing; re-anchor it on a
+      c = a;
+      f_c = f_a;
+      step = prev_step = c - b;
+    }
+    if (std::abs(f_c) < std::abs(f_b)) { // keep b the better iterate, c the far end
+      a = b;
+      f_a = f_b;
+      b = c;
+      f_b = f_c;
+      c = a;
+      f_c = f_a;
+    }
+    const Real tol_step = 2.0 * 2.220446049250313e-16 * std::abs(b) + 0.5 * tol_u;
+    const Real half = 0.5 * (c - b);
+    if (std::abs(half) <= tol_step || f_b == 0.0) break;
+    bool interpolated = false;
+    if (std::abs(prev_step) >= tol_step && std::abs(f_a) > std::abs(f_b)) {
+      const Real s = f_b / f_a;
+      Real numerator, denominator;
+      if (a == c) { // only two distinct points: secant
+        numerator = 2.0 * half * s;
+        denominator = 1.0 - s;
+      } else { // inverse quadratic through the three
+        const Real q = f_a / f_c, r = f_b / f_c;
+        numerator = s * (2.0 * half * q * (q - r) - (b - a) * (r - 1.0));
+        denominator = (q - 1.0) * (r - 1.0) * (s - 1.0);
+      }
+      if (numerator > 0.0) denominator = -denominator;
+      numerator = std::abs(numerator);
+      // THE SAFEGUARD: well inside the bracket AND at least halving the step, else bisect.
+      const Real inside = 3.0 * half * denominator - std::abs(tol_step * denominator);
+      if (2.0 * numerator < std::min(inside, std::abs(prev_step * denominator))) {
+        prev_step = step;
+        step = numerator / denominator;
+        interpolated = true;
+      }
+    }
+    if (!interpolated) step = prev_step = half;
+    a = b;
+    f_a = f_b;
+    b += (std::abs(step) > tol_step) ? step : std::copysign(tol_step, half);
+    f_b = resid(std::exp(b));
+    if (!std::isfinite(f_b)) return false;
+  }
+  root = std::exp(b);
+  // Report the bracketing pair ordered, so a caller reading the residual change across it sees
+  // the coexistence jump rather than an arbitrary sign.
+  if (b <= c) {
+    lo_out = std::exp(b);
+    hi_out = std::exp(c);
+    f_lo_out = f_b;
+    f_hi_out = f_c;
+  } else {
+    lo_out = std::exp(c);
+    hi_out = std::exp(b);
+    f_lo_out = f_c;
+    f_hi_out = f_b;
+  }
+  return true;
+}
+
+// LogBracketRootCore, discarding the bracket.
 template <typename Residual>
 PORTABLE_INLINE_FUNCTION bool LogBracketRoot(const Real lo_in, const Real hi_in,
                                              const Residual &resid, Real &root,
                                              const Real rel_tol = 1.0e-14) {
-  Real lo = lo_in, hi = hi_in;
-  if (!(hi > lo && lo > 0.0)) return false;
-  Real f_lo = resid(lo);
-  const Real f_hi = resid(hi);
-  if (!std::isfinite(f_lo) || !std::isfinite(f_hi)) return false;
-  if (f_lo == 0.0) { root = lo; return true; }
-  if (f_hi == 0.0) { root = hi; return true; }
-  if (f_lo * f_hi > 0.0) return false;
-  for (int it = 0; it < 200; ++it) {
-    const Real mid = std::sqrt(lo * hi);
-    const Real f_mid = resid(mid);
-    if (!std::isfinite(f_mid)) return false;
-    if (f_mid == 0.0) { root = mid; return true; }
-    if ((f_mid > 0.0) == (f_lo > 0.0)) { lo = mid; f_lo = f_mid; } else { hi = mid; }
-    if (hi / lo < 1.0 + rel_tol) break;
-  }
-  root = std::sqrt(lo * hi);
-  return true;
+  Real lo_out, hi_out, f_lo_out, f_hi_out;
+  return LogBracketRootCore(lo_in, hi_in, resid, rel_tol, root, lo_out, hi_out, f_lo_out,
+                            f_hi_out);
 }
 
 } // namespace cyclic_rhoe_impl

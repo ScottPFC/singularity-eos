@@ -176,39 +176,17 @@ struct BracketReport {
   }
 };
 
-// LogBracketRoot, reporting the final bracket instead of discarding it.  Same bisection, same
-// tolerance contract; see pte_cyclic_rhoe.hpp for why bisection and not an interpolating finder.
+// LogBracketRootCore, reporting the final bracket instead of discarding it.  ONE implementation
+// backs both, so the root a caller acts on and the bracket it reasons about can never diverge.
+// See pte_cyclic_rhoe.hpp for why Brent, and for why its forced bisection is what preserves the
+// coexistence jump this struct exists to read.
 template <typename Residual>
 PORTABLE_INLINE_FUNCTION BracketReport LogBracketReport(const Real lo_in, const Real hi_in,
                                                         const Residual &resid,
                                                         const Real rel_tol = 1.0e-14) {
   BracketReport out;
-  out.lo = lo_in;
-  out.hi = hi_in;
-  if (!(hi_in > lo_in && lo_in > 0.0)) return out;
-  Real lo = lo_in, hi = hi_in;
-  Real f_lo = resid(lo);
-  Real f_hi = resid(hi);
-  out.f_lo = f_lo;
-  out.f_hi = f_hi;
-  if (!std::isfinite(f_lo) || !std::isfinite(f_hi)) return out;
-  if (f_lo == 0.0) { out.root = lo; out.ok = true; return out; }
-  if (f_hi == 0.0) { out.root = hi; out.ok = true; return out; }
-  if (f_lo * f_hi > 0.0) return out;
-  for (int it = 0; it < 200; ++it) {
-    const Real mid = std::sqrt(lo * hi);
-    const Real f_mid = resid(mid);
-    if (!std::isfinite(f_mid)) return out;
-    if (f_mid == 0.0) { out.root = mid; out.lo = lo; out.hi = hi; out.ok = true; return out; }
-    if ((f_mid > 0.0) == (f_lo > 0.0)) { lo = mid; f_lo = f_mid; } else { hi = mid; f_hi = f_mid; }
-    if (hi / lo < 1.0 + rel_tol) break;
-  }
-  out.root = std::sqrt(lo * hi);
-  out.lo = lo;
-  out.hi = hi;
-  out.f_lo = f_lo;
-  out.f_hi = f_hi;
-  out.ok = true;
+  out.ok = cyclic_rhoe_impl::LogBracketRootCore(lo_in, hi_in, resid, rel_tol, out.root, out.lo,
+                                                out.hi, out.f_lo, out.f_hi);
   return out;
 }
 
