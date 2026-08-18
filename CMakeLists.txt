@@ -102,6 +102,9 @@ cmake_dependent_option(
 option(SINGULARITY_USE_V_AND_V_EOS
   "Add analytic EOSs for V&V to the variant"
   OFF)
+option(SINGULARITY_USE_PT_TABLES
+  "Add the inverted (P,T) tabulated EOS (TableDependsPT) for the PTE closure to the variant"
+  OFF)
 
 # testing options
 option(SINGULARITY_BUILD_TESTS "Compile tests" OFF)
@@ -350,6 +353,13 @@ if(SINGULARITY_BUILD_CLOSURE)
 endif()
 if(SINGULARITY_USE_HELMHOLTZ)
   target_compile_definitions(singularity-eos_Interface INTERFACE SINGULARITY_USE_HELMHOLTZ)
+endif()
+if(SINGULARITY_USE_PT_TABLES)
+  if(NOT SINGULARITY_USE_SPINER_WITH_HDF5)
+    message(FATAL_ERROR
+      "SINGULARITY_USE_PT_TABLES requires SINGULARITY_USE_SPINER_WITH_HDF5")
+  endif()
+  target_compile_definitions(singularity-eos_Interface INTERFACE SINGULARITY_USE_PT_TABLES)
 endif()
 if(SINGULARITY_USE_STELLAR_COLLAPSE)
   target_compile_definitions(singularity-eos_Interface INTERFACE SINGULARITY_USE_STELLAR_COLLAPSE)
