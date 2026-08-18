@@ -933,6 +933,30 @@ class EosBase {
                                               rho, sie);
   }
 
+  // (P,T) -> (rho, e) plus the four first partials (drho/dP)_T, (drho/dT)_P, (de/dP)_T,
+  // (de/dT)_P. Default: central finite differences of DensityEnergyFromPressureTemperature,
+  // so every EOS in the variant provides it (the analytic and cyclic P-T PTE closures,
+  // PTESolverPTAnalytic / PTESolverPTCyclic, call it through the variant). A model with a
+  // native (P,T) table (TableDependsPT) overrides this with exact analytic partials.
+  template <typename Indexer_t = Real *>
+  PORTABLE_INLINE_FUNCTION void DensityEnergyDerivativesFromPressureTemperature(
+      const Real press, const Real temp, Indexer_t &&lambda, Real &rho, Real &sie,
+      Real &drho_dP, Real &drho_dT, Real &de_dP, Real &de_dT) const {
+    const CRTP &eos = *(static_cast<CRTP const *>(this));
+    eos.DensityEnergyFromPressureTemperature(press, temp, lambda, rho, sie);
+    const Real dP = std::abs(press) * 1.0e-6 + 1.0e-12;
+    const Real dT = std::abs(temp) * 1.0e-6 + 1.0e-12;
+    Real r1, e1, r2, e2;
+    eos.DensityEnergyFromPressureTemperature(press + dP, temp, lambda, r1, e1);
+    eos.DensityEnergyFromPressureTemperature(press - dP, temp, lambda, r2, e2);
+    drho_dP = robust::ratio(r1 - r2, 2.0 * dP);
+    de_dP = robust::ratio(e1 - e2, 2.0 * dP);
+    eos.DensityEnergyFromPressureTemperature(press, temp + dT, lambda, r1, e1);
+    eos.DensityEnergyFromPressureTemperature(press, temp - dT, lambda, r2, e2);
+    drho_dT = robust::ratio(r1 - r2, 2.0 * dT);
+    de_dT = robust::ratio(e1 - e2, 2.0 * dT);
+  }
+
   // JMM: Another set of calls that are often overloaded for special cases
   // TODO(JMM): Do we also want TemperatureFromDensityPressure? That's
   // the more likely fundamental call, but the less likely "useful"

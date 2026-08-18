@@ -336,6 +336,17 @@ class Variant {
         },
         eos_);
   }
+  template <typename Indexer_t = Real *>
+  PORTABLE_INLINE_FUNCTION void DensityEnergyDerivativesFromPressureTemperature(
+      const Real press, const Real temp, Indexer_t &&lambda, Real &rho, Real &sie,
+      Real &drho_dP, Real &drho_dT, Real &de_dP, Real &de_dT) const {
+    return PortsOfCall::visit(
+        [&](const auto &eos) {
+          return eos.DensityEnergyDerivativesFromPressureTemperature(
+              press, temp, lambda, rho, sie, drho_dP, drho_dT, de_dP, de_dT);
+        },
+        eos_);
+  }
 
   template <typename Indexer_t = Real *>
   PORTABLE_INLINE_FUNCTION void InternalEnergyFromDensityPressure(
