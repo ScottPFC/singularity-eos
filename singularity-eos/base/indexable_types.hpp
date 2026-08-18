@@ -324,6 +324,10 @@ struct MeanAtomicNumber {};
 struct ElectronFraction {};
 struct RootStatus {};
 struct TableStatus {};
+// Effective scale of a sub-mixture group, read per call by SubMixtureEOS. Lives in the lambda
+// rather than in the modifier so that ONE handle can serve cells whose group composition
+// differs -- see sub_mixture_eos.hpp for why a constructor-time scale cannot.
+struct SubMixtureScale {};
 struct MassFractions {
   std::size_t n;
   PORTABLE_FORCEINLINE_FUNCTION
