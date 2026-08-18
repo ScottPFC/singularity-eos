@@ -33,6 +33,28 @@ namespace singularity {
 
 using namespace eos_base;
 
+// FORK DIVERGENCE (Pacific Fusion). `scale_` is a MASS scaling: the derived material at
+// density `rho` behaves like the base at `scale_ * rho`, and every SPECIFIC (per-gram)
+// quantity carries a factor `scale_`. So the contract is:
+//
+//     rho  -> scale_ * rho        sie  -> inv_scale_ * sie   (on input)
+//     e, s, c_v  -> scale_ * (base value)                    (on output)
+//     T, P, bulk modulus, Gruneisen  unscaled
+//
+// Upstream applied this inconsistently, and the gaps are not cosmetic. Measured against a
+// real physical pair -- SESAME 5268 TT as DD under the isotope transform (scale_ = 0.671367),
+// where the shipped tables agree to 1e-16 -- upstream gave:
+//
+//     InternalEnergyFromDensityTemperature   0.9% to 42% error   (never scaled `rho`, while
+//                                                                 FillEos on the same input
+//                                                                 pair did)
+//     SpecificHeatFrom*                      48.9% error         (= 1/scale_ - 1 exactly;
+//                                                                 c_v = de/dT and e scales)
+//
+// Both now reproduce the TT table to machine precision. Also fixed here for the same reason:
+// MinInternalEnergyFromDensity and InternalEnergyFromDensityPressure returned base-frame
+// energies, FillEos/ValuesAtReferenceState left c_v unscaled, and the vector overloads
+// repeated the scalar omissions (energy-from-(rho,T) never applied `transform.x`).
 template <typename T>
 class ScaledEOS : public EosBase<ScaledEOS<T>> {
  public:
@@ -73,7 +95,8 @@ class ScaledEOS : public EosBase<ScaledEOS<T>> {
   template <typename Indexer_t = Real *>
   PORTABLE_FUNCTION Real InternalEnergyFromDensityTemperature(
       const Real rho, const Real temperature, Indexer_t &&lambda = nullptr) const {
-    Real energy = t_.InternalEnergyFromDensityTemperature(rho, temperature, lambda);
+    Real energy =
+        t_.InternalEnergyFromDensityTemperature(scale_ * rho, temperature, lambda);
     return scale_ * energy;
   }
   template <typename Indexer_t = Real *>
@@ -84,7 +107,7 @@ class ScaledEOS : public EosBase<ScaledEOS<T>> {
   template <typename Indexer_t = Real *>
   PORTABLE_FUNCTION Real
   MinInternalEnergyFromDensity(const Real rho, Indexer_t &&lambda = nullptr) const {
-    return t_.MinInternalEnergyFromDensity(scale_ * rho, lambda);
+    return scale_ * t_.MinInternalEnergyFromDensity(scale_ * rho, lambda);
   }
   template <typename Indexer_t = Real *>
   PORTABLE_FUNCTION Real EntropyFromDensityInternalEnergy(
@@ -95,8 +118,8 @@ class ScaledEOS : public EosBase<ScaledEOS<T>> {
   template <typename Indexer_t = Real *>
   PORTABLE_FUNCTION Real SpecificHeatFromDensityInternalEnergy(
       const Real rho, const Real sie, Indexer_t &&lambda = nullptr) const {
-    return t_.SpecificHeatFromDensityInternalEnergy(scale_ * rho, inv_scale_ * sie,
-                                                    lambda);
+    return scale_ * t_.SpecificHeatFromDensityInternalEnergy(scale_ * rho,
+                                                             inv_scale_ * sie, lambda);
   }
   template <typename Indexer_t = Real *>
   PORTABLE_FUNCTION Real BulkModulusFromDensityInternalEnergy(
@@ -123,7 +146,8 @@ class ScaledEOS : public EosBase<ScaledEOS<T>> {
   template <typename Indexer_t = Real *>
   PORTABLE_FUNCTION Real SpecificHeatFromDensityTemperature(
       const Real rho, const Real temperature, Indexer_t &&lambda = nullptr) const {
-    return t_.SpecificHeatFromDensityTemperature(scale_ * rho, temperature, lambda);
+    return scale_ *
+           t_.SpecificHeatFromDensityTemperature(scale_ * rho, temperature, lambda);
   }
   template <typename Indexer_t = Real *>
   PORTABLE_FUNCTION Real BulkModulusFromDensityTemperature(
@@ -140,6 +164,7 @@ class ScaledEOS : public EosBase<ScaledEOS<T>> {
   InternalEnergyFromDensityPressure(const Real rho, const Real P, Real &sie,
                                     Indexer_t &&lambda = nullptr) const {
     t_.InternalEnergyFromDensityPressure(scale_ * rho, P, sie, lambda);
+    sie *= scale_;
   }
   template <typename Indexer_t = Real *>
   PORTABLE_FUNCTION void FillEos(Real &rho, Real &temp, Real &energy, Real &press,
@@ -151,11 +176,13 @@ class ScaledEOS : public EosBase<ScaledEOS<T>> {
       srho = scale_ * rho;
       t_.FillEos(srho, temp, energy, press, cv, bmod, output, lambda);
       energy = scale_ * energy;
+      cv = scale_ * cv;
       break;
     case thermalqs::density | thermalqs::specific_internal_energy:
       srho = scale_ * rho;
       senergy = inv_scale_ * energy;
       t_.FillEos(srho, temp, senergy, press, cv, bmod, output, lambda);
+      cv = scale_ * cv;
       break;
     default:
       EOS_ERROR("Didn't find a valid input for ScaledEOS::FillEOS\n");
@@ -170,6 +197,7 @@ class ScaledEOS : public EosBase<ScaledEOS<T>> {
     t_.ValuesAtReferenceState(rho, temp, sie, press, cv, bmod, dpde, dvdt, lambda);
     rho *= inv_scale_;
     sie *= scale_;
+    cv *= scale_;
   }
 
   // vector implementations
@@ -212,6 +240,7 @@ class ScaledEOS : public EosBase<ScaledEOS<T>> {
                                            const int num, LambdaIndexer &&lambdas,
                                            Transform &&transform = Transform()) const {
     transform.x.apply(scale_);
+    transform.f.apply(scale_);
     t_.MinInternalEnergyFromDensity(rhos, sies, scratch, num,
                                     std::forward<LambdaIndexer>(lambdas),
                                     std::forward<Transform>(transform));
@@ -222,6 +251,7 @@ class ScaledEOS : public EosBase<ScaledEOS<T>> {
       const Real *rhos, const Real *temperatures, Real *cvs, Real *scratch, const int num,
       LambdaIndexer &&lambdas, Transform &&transform = Transform()) const {
     transform.x.apply(scale_);
+    transform.f.apply(scale_);
     t_.SpecificHeatFromDensityTemperature(rhos, temperatures, cvs, scratch, num,
                                           std::forward<LambdaIndexer>(lambdas),
                                           std::forward<Transform>(transform));
@@ -233,6 +263,7 @@ class ScaledEOS : public EosBase<ScaledEOS<T>> {
       LambdaIndexer &&lambdas, Transform &&transform = Transform()) const {
     transform.x.apply(scale_);
     transform.y.apply(inv_scale_);
+    transform.f.apply(scale_);
     t_.SpecificHeatFromDensityInternalEnergy(rhos, sies, cvs, scratch, num,
                                              std::forward<LambdaIndexer>(lambdas),
                                              std::forward<Transform>(transform));
@@ -284,6 +315,7 @@ class ScaledEOS : public EosBase<ScaledEOS<T>> {
   inline void InternalEnergyFromDensityTemperature(
       const Real *rhos, const Real *temperatures, Real *sies, Real *scratch,
       const int num, LambdaIndexer &&lambdas, Transform &&transform = Transform()) const {
+    transform.x.apply(scale_);
     transform.f.apply(scale_);
     t_.InternalEnergyFromDensityTemperature(rhos, temperatures, sies, scratch, num,
                                             std::forward<LambdaIndexer>(lambdas),
