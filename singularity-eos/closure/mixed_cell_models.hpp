@@ -24,6 +24,8 @@
 #include <singularity-eos/eos/eos.hpp>
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <utility>
 
 #ifdef SINGULARITY_USE_KOKKOSKERNELS
@@ -102,6 +104,10 @@ struct SolverStatus {
   std::size_t small_step_iters = 0;
   std::size_t stagnation_iters = 0;
   std::size_t pressure_jump_attempts = 0;
+  // Iterations that fell back to a bracketed coordinate step because a Newton step could not
+  // contract the residual (PTESolveDual only).  Zero means the solve ran at pure-Newton cost, so
+  // this is the diagnostic that says whether a cell needed the safeguard at all.
+  std::size_t safeguard_iters = 0;
   Real residual;
 };
 
@@ -1133,7 +1139,11 @@ class PTESolverBase {
         Pguess = std::max(Pmin, std::min(Pmax, P));
       }
       eos.DensityEnergyFromPressureTemperature(Pguess, T, lambda, rho, sie);
-      cv = eos.SpecificHeatFromDensityInternalEnergy(rho, sie, lambda);
+      // T is KNOWN here, so read cv directly at (rho, T).  The former
+      // SpecificHeatFromDensityInternalEnergy(rho, sie) RE-INVERTED (rho,sie)->T (a ~40-iteration
+      // bisection) just to recover the T we already have -- pure redundant work in the cyclic
+      // Init's T-guess loop (~3 inversions/cell).  cv is identical (the round trip returns T).
+      cv = eos.SpecificHeatFromDensityTemperature(rho, T, lambda);
     } else { // use density, not pressure.
       sie = eos.InternalEnergyFromDensityTemperature(rho, T, lambda);
       cv = eos.SpecificHeatFromDensityTemperature(rho, T, lambda);
@@ -1215,7 +1225,10 @@ class PTESolverBase {
     Real Pideal, Tideal;
     GetIdealPTE(Pideal, Tideal);
 
-    // temporarily hijack some of the scratch space
+    // Temporarily hijack the head of the scratch buffer.  This needs 4*nmat + neq doubles, which
+    // every solver's *RequiredScratch guarantees via PTEScratchWithIdealPTE -- do not add arrays
+    // here without widening that bound, and note it overwrites dx/sol_scratch (and, for a small
+    // jacobian, u/rhobar) so everything read below is copied out FIRST and restored on failure.
     Real *etemp = jacobian;
     Real *ptemp = jacobian + nmat;
     Real *vtemp = jacobian + 2 * nmat;
@@ -1388,14 +1401,26 @@ PORTABLE_INLINE_FUNCTION Real ApproxTemperatureFromRhoMatU(
  *
  */
 // clang-format on
+// PTESolverBase::TryIdealPTE temporarily hijacks the HEAD of the scratch buffer as five arrays
+// (etemp, ptemp, vtemp, rtemp of nmat each, then res of neq), so every solver's scratch must hold
+// at least 4*nmat + neq regardless of what its own Jacobian needs.  That requirement is invisible
+// where neq grows with nmat -- the jacobian alone covers it -- but the (P,T) solvers fix neq = 2,
+// so for them the hijack reaches past the buffer once nmat >= 5.  Wrapping every requirement in
+// this max() makes the coupling explicit and is a no-op wherever the Jacobian already dominates.
+constexpr inline std::size_t PTEScratchWithIdealPTE(const std::size_t own, const std::size_t nmat,
+                                                    const std::size_t neq) {
+  return (own > 4 * nmat + neq) ? own : (4 * nmat + neq);
+}
+
 // ======================================================================
 // PTE Solver RhoT
 // ======================================================================
 constexpr inline int PTESolverRhoTRequiredScratch(const std::size_t nmat) {
   std::size_t neq = nmat;
-  return neq * neq   // jacobian
-         + 4 * neq   // dx, residual, and sol_scratch
-         + 6 * nmat; // all the nmat sized arrays
+  return static_cast<int>(PTEScratchWithIdealPTE(neq * neq // jacobian
+                                                     + 4 * neq // dx, residual, sol_scratch
+                                                     + 6 * nmat, // all the nmat sized arrays
+                                                 nmat, neq));
 }
 constexpr inline size_t PTESolverRhoTRequiredScratchInBytes(const std::size_t nmat) {
   return PTESolverRhoTRequiredScratch(nmat) * sizeof(Real);
@@ -1811,10 +1836,14 @@ class PTESolverRhoT
 // PT space solver
 // ======================================================================
 constexpr inline int PTESolverPTRequiredScratch(const std::size_t nmat) {
-  constexpr int neq = 2;
-  return neq * neq   // jacobian
-         + 4 * neq   // dx, residual, and sol_scratch
-         + 2 * nmat; // all the nmat sized arrays
+  // neq is FIXED at 2 here (the (P,T) solvers carry one pressure and one temperature unknown, not
+  // one per material), so unlike every other solver the jacobian does not grow with nmat and does
+  // not cover TryIdealPTE's 4*nmat + neq hijack.  See PTEScratchWithIdealPTE.
+  constexpr std::size_t neq = 2;
+  return static_cast<int>(PTEScratchWithIdealPTE(neq * neq // jacobian
+                                                     + 4 * neq // dx, residual, sol_scratch
+                                                     + 2 * nmat, // all the nmat sized arrays
+                                                 nmat, neq));
 }
 constexpr inline size_t PTESolverPTRequiredScratchInBytes(const std::size_t nmat) {
   return PTESolverPTRequiredScratch(nmat) * sizeof(Real);
@@ -1822,6 +1851,9 @@ constexpr inline size_t PTESolverPTRequiredScratchInBytes(const std::size_t nmat
 template <typename EOSIndexer, typename RealIndexer, typename LambdaIndexer>
 class PTESolverPT
     : public mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer> {
+  // protected (not private) so subclasses (PTESolverPTAnalytic) inherit these base-member
+  // handles and can override Jacobian()/etc.
+ protected:
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::InitBase;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::AssignIncrement;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::nmat;
@@ -2048,6 +2080,10 @@ class PTESolverPT
 
   PORTABLE_INLINE_FUNCTION
   Real GetPhysicalT() const { return Tnorm * Tequil; }
+  // Physical equilibrium pressure (scaled Pequil * uscale) -- for the cyclic-solver
+  // per-iteration diagnostic in PTESolverPTCyclicSolve.
+  PORTABLE_INLINE_FUNCTION
+  Real GetPhysicalP() const { return Pequil * uscale; }
 
   // No-op debug stubs (only PTESolverRhoT has real prints)
   PORTABLE_INLINE_FUNCTION
@@ -2057,9 +2093,10 @@ class PTESolverPT
   PORTABLE_INLINE_FUNCTION
   bool IsAtTFloor() const { return false; }
 
- private:
+ protected:
   // TODO(JMM): Should these have trailing underscores?
-  // Current P, T state
+  // Current P, T state. Protected (not private) so PTESolverPTAnalytic can override
+  // Jacobian() using the equilibrium (P,T) directly.
   Real Pequil;
   Real Tequil;
   // Scratch states for test update
@@ -2069,14 +2106,414 @@ class PTESolverPT
 };
 
 // ======================================================================
+// P-T solver with an ANALYTIC Jacobian (fast path / fallback for the cyclic solver)
+// ======================================================================
+// Identical to PTESolverPT except Jacobian() uses the EOS's exact (P,T) partials
+// (DensityEnergyDerivativesFromPressureTemperature, e.g. TableDependsPT) instead of a
+// finite difference. Because those partials are the exact derivatives of the same
+// DensityEnergyFromPressureTemperature the residual is built from, the Newton step is
+// consistent, and we avoid the base solver's FD stencil that deliberately perturbs P
+// toward a phase transition (a source of noise near transitions). Requires an EOS that
+// provides the derivatives method; use only on (P,T)-table mixtures (TableDependsPT).
+template <typename EOSIndexer, typename RealIndexer, typename LambdaIndexer>
+class PTESolverPTAnalytic
+    : public PTESolverPT<EOSIndexer, RealIndexer, LambdaIndexer> {
+  using Base = PTESolverPT<EOSIndexer, RealIndexer, LambdaIndexer>;
+  // Base-member handles (nmat, eos, rho, rhobar, uscale, Tnorm, lambda, jacobian,
+  // Pequil, Tequil) are inherited protected from PTESolverPT / PTESolverBase.
+  using Base::eos;
+  using Base::jacobian;
+  using Base::lambda;
+  using Base::nmat;
+  using Base::Pequil;
+  using Base::rho;
+  using Base::rhobar;
+  using Base::Tequil;
+  using Base::Tnorm;
+  using Base::uscale;
+
+ public:
+  template <typename EOS_t, typename Real_t, typename Lambda_t>
+  PORTABLE_INLINE_FUNCTION
+  PTESolverPTAnalytic(const std::size_t nmat, EOS_t &&eos, const Real vfrac_tot,
+                      const Real sie_tot, Real_t &&rho, Real_t &&vfrac, Real_t &&sie,
+                      Real_t &&temp, Real_t &&press, Lambda_t &&lambda, Real *scratch,
+                      const Real Tnorm = 0.0, const MixParams &params = MixParams())
+      : Base(nmat, std::forward<EOS_t>(eos), vfrac_tot, sie_tot, std::forward<Real_t>(rho),
+             std::forward<Real_t>(vfrac), std::forward<Real_t>(sie),
+             std::forward<Real_t>(temp), std::forward<Real_t>(press),
+             std::forward<Lambda_t>(lambda), scratch, Tnorm, params) {}
+
+  static inline std::string MethodType() { return std::string("PTESolverPTAnalytic"); }
+
+  PORTABLE_INLINE_FUNCTION
+  void Jacobian() const {
+    Real dudT_P_sum = 0.0, dudP_T_sum = 0.0;
+    Real rbor2_dr_dT_P_sum = 0.0, rbor2_dr_dP_T_sum = 0.0;
+    for (std::size_t m = 0; m < nmat; ++m) {
+      Real r, e, drho_dP, drho_dT, de_dP, de_dT;
+      eos[m].DensityEnergyDerivativesFromPressureTemperature(
+          uscale * Pequil, Tnorm * Tequil, lambda[m], r, e, drho_dP, drho_dT, de_dP, de_dT);
+      // Rescale to the solver's nondimensional (Pequil, Tequil) variables, matching the
+      // finite-difference convention in PTESolverPT::Jacobian: physical P = uscale*Pequil,
+      // physical T = Tnorm*Tequil, and u_m = rhobar_m * sie_m / uscale.
+      const Real drdp = drho_dP * uscale;                 // d rho_m / dPequil
+      const Real drdT = drho_dT * Tnorm;                  // d rho_m / dTequil
+      const Real dudp = rhobar[m] * de_dP;                // d u_m / dPequil
+      const Real dudT = rhobar[m] * (Tnorm / uscale) * de_dT; // d u_m / dTequil
+      const Real rbor2 = robust::ratio(rhobar[m], rho[m] * rho[m]);
+      rbor2_dr_dP_T_sum += rbor2 * drdp;
+      rbor2_dr_dT_P_sum += rbor2 * drdT;
+      dudP_T_sum += dudp;
+      dudT_P_sum += dudT;
+    }
+    jacobian[0] = -rbor2_dr_dT_P_sum;
+    jacobian[1] = -rbor2_dr_dP_T_sum;
+    jacobian[2] = dudT_P_sum;
+    jacobian[3] = dudP_T_sum;
+  }
+};
+
+// ======================================================================
+// Cyclic P-T solver (Clayton-McConnell-Solomon Alg 5.2) -- PRIMARY PTE method
+// ======================================================================
+// The cyclic method is NOT a 2x2 Newton (that is PTESolverPT): each iteration takes a
+// 1-D Newton step in P on the density residual varrho = 1/tau - 1/tau0, a 1-D Newton step
+// in T on the enthalpy residual h (d_T h = c_p > 0), then intersects the tau-level-set
+// tangent (slope (dP/dT)_varrho) with the isentrope tangent (slope (dT/dP)_s) for the next
+// (P,T). It converges from far seeds where the 2-D Newton fails (Theorem 5.2), given a
+// thermodynamically admissible mixture (each EOS MP-stable -> unique root, Theorem 2.26).
+// It therefore uses a dedicated loop (PTESolverPTCyclicSolve) instead of the generic
+// PTESolver Newton+line-search driver (the cyclic step is not a descent direction on the
+// residual norm, so a line search would fight it). Ports pfc _pte.py::_cyclic_step exactly.
+// Requires an EOS providing DensityEnergyDerivativesFromPressureTemperature (TableDependsPT).
+template <typename EOSIndexer, typename RealIndexer, typename LambdaIndexer>
+class PTESolverPTCyclic
+    : public PTESolverPT<EOSIndexer, RealIndexer, LambdaIndexer> {
+  using Base = PTESolverPT<EOSIndexer, RealIndexer, LambdaIndexer>;
+  using Base::eos;
+  using Base::lambda;
+  using Base::nmat;
+  using Base::params_;
+  using Base::Pequil;
+  using Base::press;
+  using Base::rho;
+  using Base::rho_total;
+  using Base::rhobar;
+  using Base::sie;
+  using Base::sie_total;
+  using Base::temp;
+  using Base::Tequil;
+  using Base::Tnorm;
+  using Base::u;
+  using Base::uscale;
+  using Base::vfrac;
+
+  struct Mix {
+    Real tau, e, dtau_dp, dtau_dt, de_dp, de_dt;
+  };
+
+  // Mass-fraction-weighted mixture tau, e and (P,T) partials at physical (P,T).
+  PORTABLE_INLINE_FUNCTION Mix mixture_(const Real P, const Real T) const {
+    Mix mx{0., 0., 0., 0., 0., 0.};
+    for (std::size_t m = 0; m < nmat; ++m) {
+      Real rho_m, sie_m, drho_dP, drho_dT, de_dP, de_dT;
+      eos[m].DensityEnergyDerivativesFromPressureTemperature(
+          P, T, lambda[m], rho_m, sie_m, drho_dP, drho_dT, de_dP, de_dT);
+      const Real Y = robust::ratio(rhobar[m], rho_total);
+      const Real tau_m = robust::ratio(1.0, rho_m);
+      const Real inv_rho2 = robust::ratio(1.0, rho_m * rho_m);
+      mx.tau += Y * tau_m;
+      mx.e += Y * sie_m;
+      mx.dtau_dp += Y * (-drho_dP * inv_rho2); // dtau/dP = -(drho/dP)/rho^2
+      mx.dtau_dt += Y * (-drho_dT * inv_rho2);
+      mx.de_dp += Y * de_dP;
+      mx.de_dt += Y * de_dT;
+    }
+    return mx;
+  }
+
+  // Intersect line A: P = pA + a (T - tA) with line B: T = tB + b (P - pB).
+  PORTABLE_INLINE_FUNCTION bool intersect_(const Real pA, const Real tA, const Real a,
+                                           const Real pB, const Real tB, const Real b,
+                                           Real &P, Real &T) const {
+    const Real ab = a * b;
+    if (std::abs(1.0 - ab) < 1.0e-300 || !std::isfinite(ab)) return false;
+    T = (tB + b * (pA - pB) - ab * tA) / (1.0 - ab);
+    P = pA + a * (T - tA);
+    return std::isfinite(P) && std::isfinite(T);
+  }
+
+ public:
+  template <typename EOS_t, typename Real_t, typename Lambda_t>
+  PORTABLE_INLINE_FUNCTION
+  PTESolverPTCyclic(const std::size_t nmat, EOS_t &&eos, const Real vfrac_tot,
+                    const Real sie_tot, Real_t &&rho, Real_t &&vfrac, Real_t &&sie,
+                    Real_t &&temp, Real_t &&press, Lambda_t &&lambda, Real *scratch,
+                    const Real Tnorm = 0.0, const MixParams &params = MixParams())
+      : Base(nmat, std::forward<EOS_t>(eos), vfrac_tot, sie_tot, std::forward<Real_t>(rho),
+             std::forward<Real_t>(vfrac), std::forward<Real_t>(sie),
+             std::forward<Real_t>(temp), std::forward<Real_t>(press),
+             std::forward<Lambda_t>(lambda), scratch, Tnorm, params) {}
+
+  static inline std::string MethodType() { return std::string("PTESolverPTCyclic"); }
+
+  // Lean (P,T)-native initialization for the cyclic solver.
+  //
+  // PTESolverPT::Init() (inherited) routes through PTESolverBase::InitBase(),
+  // which for EVERY material does
+  //     sie[m] = eos[m].InternalEnergyFromDensityTemperature(rho[m], Tguess),
+  // and gets its temperature guess from GetTguess() -> a Newton step that calls
+  // SpecificHeatFromDensityInternalEnergy(rho, sie).  On a (P,T)-indexed
+  // TableDependsPT both are (rho,T)/(rho,sie) inversions: the first bisects
+  // pressureOfRhoT_ ~100x; the second nests TemperatureFromDensityInternalEnergy
+  // (~100x) inside SpecificHeatFromDensityTemperature (~100x) for ~1e4 native
+  // lookups per material.  For the cyclic solver ALL of that work is discarded --
+  // Init() immediately overwrites rho/sie/vfrac/u from
+  // DensityEnergyFromPressureTemperature(Pequil, Tnorm).  Since TableDependsPT is
+  // pressure-preferred and the caller supplies a positive P seed in press[], we
+  // seed directly in the native (P,T) direction: one
+  // DensityEnergyFromPressureTemperature per material, no (rho,T) inversion
+  // anywhere.  This mirrors pfc _pte.py::solve_pte, which seeds from
+  // (pressure_guess, temperature_guess) with no init inversion.  Isolated to the
+  // cyclic solver: InitBase()/GetTguess() and every other PTE solver are unchanged.
+  PORTABLE_INLINE_FUNCTION
+  Real Init() {
+    // rhobar[m] and rho_total (fixed mixture quantities).
+    this->InitRhoBarandRho();
+    // Energy normalization (as in InitBase()): make Sum(u_m) ~ 1.
+    const Real utotal = rho_total * sie_total;
+    uscale = std::max(std::abs(utotal), 1.0e-14);
+    this->utotal_scale = robust::ratio(utotal, uscale);
+
+    // Temperature normalization.  Use the caller's guess (stored in Tnorm) when
+    // positive, else the largest per-material temperature, else the default --
+    // the same fallback ladder as GetTguess() minus its Newton refinement (the
+    // first CyclicStep does a T-Newton step on the enthalpy residual anyway).
+    Real Tguess = (Tnorm > 0.0) ? Tnorm : params_.default_tguess;
+    for (std::size_t m = 0; m < nmat; ++m) {
+      Tguess = std::max(Tguess, temp[m]);
+      Tguess = std::max(eos[m].MinimumTemperature(), Tguess);
+    }
+    PORTABLE_REQUIRE(Tguess > 0., "Non-positive temperature guess for PTE");
+    PORTABLE_REQUIRE(Tguess < params_.temperature_limit,
+                     "Very large input temperature or temperature guess");
+
+    // Equilibrium-pressure seed: vfrac-weighted |press[m]| (identical to
+    // PTESolverPT::Init()).  The caller seeds a single common mixture-match
+    // pressure, so this reduces to that pressure.
+    Real Pseed = 0.0;
+    Real vsum = 0.0;
+    for (std::size_t m = 0; m < nmat; ++m) {
+      Pseed += std::abs(press[m]) * vfrac[m];
+      vsum += vfrac[m];
+    }
+    Pseed = robust::ratio(Pseed, vsum); // physical
+
+    // Energy-based T refinement -- the Newton step GetTguess() takes, which this lean cyclic
+    // Init previously skipped (assuming the first CyclicStep would climb T).  That assumption
+    // fails for a cold cell whose STORED energy implies a much hotter ion equilibrium (e.g. the
+    // fuel's large ion-energy reference): seeded at the raw cell T, the first CyclicStep's
+    // T-Newton overshoots DOWN to the T-floor (Tmin) and stalls -- reproduced offline (pfc
+    // _pte.py collapses identically from a cold Tguess, and converges from a warm one).  Take up
+    // to 3 Newton steps on the energy residual at Pseed, accepting ONLY increases (GetTguess
+    // convention), so we seed near the hot energy-consistent root.  Cheap: 3 * nmat EOS evals.
+    if (params_.iterate_t_guess) {
+      // Accept-only-increases Newton on the energy residual (GetTguess convention;
+      // utotal = rho_total*sie_total is the target total energy computed above). Self-limiting
+      // for a GOOD (already-warm) guess: the first step that does not raise Tguess breaks the
+      // loop, so a warm / warm-started cell pays ~one nmat-eval round, not three -- no meaningful
+      // slowdown when the initial guess is already near the equilibrium; the extra work is spent
+      // only where it is needed (a cold guess that must climb to a hot root).
+      for (int it = 0; it < 3; ++it) {
+        Real usum = 0.0, dudt = 0.0;
+        for (std::size_t m = 0; m < nmat; ++m) {
+          Real sie_m, cv_m;
+          this->GetSieCvFromTAndPreferred(eos[m], std::min(rho[m], eos[m].MaximumDensity()),
+                                          Pseed, Tguess, lambda[m], sie_m, cv_m);
+          usum += rhobar[m] * sie_m;
+          dudt += rhobar[m] * cv_m;
+        }
+        const Real Tnew = Tguess - robust::ratio(usum - utotal, dudt);
+        if (!(Tnew > Tguess)) break; // good guess (no increase) -> stop; avoid wasted steps
+        Tguess = std::min(params_.temperature_limit, Tnew);
+      }
+      for (std::size_t m = 0; m < nmat; ++m)
+        Tguess = std::max(eos[m].MinimumTemperature(), Tguess);
+    }
+
+    Tnorm = Tguess;
+    Pequil = robust::ratio(Pseed, uscale); // scaled
+    Tequil = 1.0;                          // == Tguess / Tnorm
+
+    // One native (P,T) lookup per material fixes (rho, sie); vfrac/u/temp/press
+    // follow.  No InternalEnergyFromDensityTemperature / pressureOfRhoT_ bisection.
+    for (std::size_t m = 0; m < nmat; ++m) {
+      eos[m].DensityEnergyFromPressureTemperature(Pseed, Tguess, lambda[m], rho[m],
+                                                  sie[m]);
+      vfrac[m] = robust::ratio(rhobar[m], rho[m]);
+      u[m] = robust::ratio(sie[m] * rhobar[m], uscale);
+      temp[m] = Tequil;
+      press[m] = Pequil;
+    }
+    this->Residual();
+    return this->ResidualNorm();
+  }
+
+  // One cyclic iteration: update (Pequil, Tequil), re-evaluate per-material state and the
+  // mixture residual. Returns the new residual norm. (Ports _pte.py::_cyclic_step.)
+  PORTABLE_INLINE_FUNCTION
+  Real CyclicStep() {
+    const Real tau0 = robust::ratio(1.0, rho_total); // mixture specific volume target
+    const Real e0 = sie_total;
+    const Real P = Pequil * uscale, T = Tequil * Tnorm; // physical
+    const Mix mix = mixture_(P, T);
+
+    // Aggregate box once (P bounds depend on the current T reference).
+    Real Plo, Phi, Tlo, Thi;
+    Box_(Plo, Phi, Tlo, Thi, T);
+
+    // Step 1: Newton step in P on the density residual varrho = 1/tau - 1/tau0.
+    const Real varrho = robust::ratio(1.0, mix.tau) - robust::ratio(1.0, tau0);
+    const Real dvarrho_dp = -mix.dtau_dp / (mix.tau * mix.tau);
+    Real p_tilde = (dvarrho_dp == 0.0) ? P : P - varrho / dvarrho_dp;
+    // Safeguarded Newton: keep the intermediate P inside the box (the domain R that Thm 5.2's
+    // well-posedness assumes) BEFORE the mixture eval below.  Alg 5.2 clamps only the final
+    // (P,T), but a tabular EOS is stable only on R: a P-Newton overshoot to P<=0 lands on the
+    // near-vacuum branch (K_T~0, c_p<0), poisoning the enthalpy/tangent step and collapsing T
+    // to the floor.  Mirrors pfc _pte.py::_cyclic_step.
+    p_tilde = std::min(std::max(p_tilde, Plo), Phi);
+
+    // Step 2: Newton step in T on the enthalpy residual h at (p_tilde, T); d_T h = c_p.
+    const Mix mix_p = mixture_(p_tilde, T);
+    const Real enth = (mix_p.e + p_tilde * mix_p.tau) - (e0 + p_tilde * tau0);
+    const Real c_p = mix_p.de_dt + p_tilde * mix_p.dtau_dt;
+    Real t_tilde = (c_p == 0.0) ? T : T - enth / c_p;
+    t_tilde = std::min(std::max(t_tilde, Tlo), Thi);  // same safeguard on the intermediate T
+
+    // Step 3: intersect the tau-level-set tangent at (p_tilde, T) with the isentrope
+    // tangent at (p_tilde, t_tilde); fall back to the enthalpy-curve tangent.
+    const Real slope_a =
+        (mix_p.dtau_dp == 0.0) ? 0.0 : -mix_p.dtau_dt / mix_p.dtau_dp; // (dP/dT)_varrho
+    const Mix mix_pt = mixture_(p_tilde, t_tilde);
+    const Real c_p_pt = mix_pt.de_dt + p_tilde * mix_pt.dtau_dt;
+    const Real slope_b_s =
+        (c_p_pt == 0.0) ? 0.0 : t_tilde * mix_pt.dtau_dt / c_p_pt; // (dT/dP)_s
+    Real Pn, Tn;
+    bool ok = intersect_(p_tilde, T, slope_a, p_tilde, t_tilde, slope_b_s, Pn, Tn);
+    if (!ok || !InBox_(Pn, Tn)) {
+      const Real slope_b_h =
+          (c_p_pt == 0.0) ? 0.0 : (t_tilde * mix_pt.dtau_dt - mix_pt.tau) / c_p_pt;
+      Real Pa, Ta;
+      if (intersect_(p_tilde, T, slope_a, p_tilde, t_tilde, slope_b_h, Pa, Ta)) {
+        Pn = Pa;
+        Tn = Ta;
+        ok = true;
+      }
+    }
+    if (!ok) {
+      Pn = p_tilde;
+      Tn = t_tilde;
+    }
+    ClampToBox_(Pn, Tn);
+
+    // Commit the new state (physical -> scaled) and refresh per-material quantities.
+    Pequil = robust::ratio(Pn, uscale);
+    Tequil = robust::ratio(Tn, Tnorm);
+    for (std::size_t m = 0; m < nmat; ++m) {
+      eos[m].DensityEnergyFromPressureTemperature(Pn, Tn, lambda[m], rho[m], sie[m]);
+      vfrac[m] = robust::ratio(rhobar[m], rho[m]);
+      u[m] = robust::ratio(sie[m] * rhobar[m], uscale);
+      temp[m] = Tequil;
+      press[m] = Pequil;
+    }
+    this->Residual();
+    return this->ResidualNorm();
+  }
+
+  // Aggregate EOS-domain box over all materials (tightest common (P,T) rectangle).
+  PORTABLE_INLINE_FUNCTION void Box_(Real &Plo, Real &Phi, Real &Tlo, Real &Thi,
+                                     const Real Tref) const {
+    Plo = eos[0].MinimumPressure();
+    Phi = eos[0].MaximumPressureAtTemperature(Tref);
+    Tlo = eos[0].MinimumTemperature();
+    // Upper T bound: the solver's temperature_limit (the EOS variant does not forward a
+    // MaximumTemperature accessor; the lower T/P bounds are what guard the failure modes).
+    Thi = params_.temperature_limit;
+    for (std::size_t m = 1; m < nmat; ++m) {
+      Plo = std::max(Plo, eos[m].MinimumPressure());
+      Phi = std::min(Phi, eos[m].MaximumPressureAtTemperature(Tref));
+      // T floor: MIN over materials, not MAX.  A trace material with a higher SESAME grid Tmin
+      // (e.g. Cu starts at 20 K) must NOT floor a fuel-dominated cold cell above the fuel's Tmin
+      // (~15 K) -- that excludes the true cold solution and collapses the solve.  Each material's
+      // evaluate clamps T to its own grid, so a minor material below its Tmin extrapolates as a
+      // clamp (negligible at trace mass fraction).
+      Tlo = std::min(Tlo, eos[m].MinimumTemperature());
+    }
+  }
+  PORTABLE_INLINE_FUNCTION bool InBox_(const Real P, const Real T) const {
+    Real Plo, Phi, Tlo, Thi;
+    Box_(Plo, Phi, Tlo, Thi, T);
+    return P >= Plo && P <= Phi && T >= Tlo && T <= Thi;
+  }
+  PORTABLE_INLINE_FUNCTION void ClampToBox_(Real &P, Real &T) const {
+    Real Plo, Phi, Tlo, Thi;
+    Box_(Plo, Phi, Tlo, Thi, T);
+    P = std::min(std::max(P, Plo), Phi);
+    T = std::min(std::max(T, Tlo), Thi);
+  }
+};
+
+// Dedicated driver for the cyclic P-T solver: iterate the cyclic step to convergence.
+// (Mirrors pfc _pte.py::solve_pte; distinct from the Newton PTESolver above because the
+// cyclic step is not a line-search descent direction.)
+template <class System>
+PORTABLE_INLINE_FUNCTION SolverStatus PTESolverPTCyclicSolve(System &s) {
+  SolverStatus status;
+  Real &err = status.residual;
+  err = s.Init();
+  const MixParams &params = s.GetParams();
+  auto &niter = s.Niter();
+  const std::size_t pte_max_iter = s.Nmat() * params.pte_max_iter_per_mat;
+  status.converged = false;
+  // Per-iteration diagnostic (env PTE_CYCLIC_DEBUG): trace (P,T,residual) so a stall can be
+  // compared to the offline pfc _pte.py::solve_pte trajectory (does T climb to equilibrium?).
+  // CPU-only; checked once. Prints seed + every 20th iter + the final state, per solve.
+  static const bool cyc_dbg = (std::getenv("PTE_CYCLIC_DEBUG") != nullptr);
+  if (cyc_dbg) {
+    std::printf("[CYC] seed  P=%.6g T=%.6g r=%.4g  (pte_max_iter=%zu)\n", s.GetPhysicalP(),
+                s.GetPhysicalT(), err, pte_max_iter);
+  }
+  for (niter = 0; niter < pte_max_iter; ++niter) {
+    status.max_niter = std::max(status.max_niter, niter);
+    auto check = s.CheckPTE();
+    status.converged = check.first;
+    if (status.converged) break;
+    err = s.CyclicStep();
+    if (cyc_dbg && (niter % 20 == 0)) {
+      std::printf("[CYC] n=%zu P=%.6g T=%.6g r=%.4g\n", niter, s.GetPhysicalP(),
+                  s.GetPhysicalT(), err);
+    }
+  }
+  if (cyc_dbg) {
+    std::printf("[CYC] end   conv=%d niter=%zu P=%.6g T=%.6g r=%.4g\n",
+                static_cast<int>(status.converged), niter, s.GetPhysicalP(), s.GetPhysicalT(),
+                err);
+  }
+  s.Finalize();
+  return status;
+}
+
+// ======================================================================
 // fixed temperature solver
 // ======================================================================
 constexpr inline std::size_t PTESolverFixedTRequiredScratch(const std::size_t nmat) {
   std::size_t neq = nmat;
-  return neq * neq   // jacobian
-         + 4 * neq   // dx, residual, and sol_scratch
-         + 2 * nmat  // rhobar and u in base
-         + 2 * nmat; // nmat sized arrays in fixed T solver
+  return PTEScratchWithIdealPTE(neq * neq // jacobian
+                                    + 4 * neq // dx, residual, and sol_scratch
+                                    + 2 * nmat // rhobar and u in base
+                                    + 2 * nmat, // nmat sized arrays in fixed T solver
+                                nmat, neq);
 }
 constexpr inline size_t PTESolverFixedTRequiredScratchInBytes(const std::size_t nmat) {
   return PTESolverFixedTRequiredScratch(nmat) * sizeof(Real);
@@ -2302,10 +2739,11 @@ class PTESolverFixedT
 // ======================================================================
 constexpr inline std::size_t PTESolverFixedPRequiredScratch(const std::size_t nmat) {
   std::size_t neq = nmat + 1;
-  return neq * neq   // jacobian
-         + 4 * neq   // dx, residual, and sol_scratch
-         + 2 * nmat  // all the nmat sized arrays in base
-         + 3 * nmat; // all the nmat sized arrays in fixedP
+  return PTEScratchWithIdealPTE(neq * neq // jacobian
+                                    + 4 * neq // dx, residual, and sol_scratch
+                                    + 2 * nmat // all the nmat sized arrays in base
+                                    + 3 * nmat, // all the nmat sized arrays in fixedP
+                                nmat, neq);
 }
 constexpr inline size_t PTESolverFixedPRequiredScratchInBytes(const std::size_t nmat) {
   return PTESolverFixedPRequiredScratch(nmat) * sizeof(Real);
@@ -2558,9 +2996,10 @@ class PTESolverFixedP
 // ======================================================================
 constexpr inline std::size_t PTESolverRhoURequiredScratch(const std::size_t nmat) {
   std::size_t neq = 2 * nmat;
-  return neq * neq   // jacobian
-         + 4 * neq   // dx, residual, and sol_scratch
-         + 8 * nmat; // all the nmat sized arrays
+  return PTEScratchWithIdealPTE(neq * neq // jacobian
+                                    + 4 * neq // dx, residual, and sol_scratch
+                                    + 8 * nmat, // all the nmat sized arrays
+                                nmat, neq);
 }
 constexpr inline size_t PTESolverRhoURequiredScratchInBytes(const std::size_t nmat) {
   return PTESolverRhoURequiredScratch(nmat) * sizeof(Real);
