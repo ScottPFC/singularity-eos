@@ -608,6 +608,32 @@ inline herr_t SpinerEOSDependsRhoT::loadDataboxes_(const std::string &matid_str,
   lTMax_ = P_.range(0).max();
   TMax_ = from_log(lTMax_, lTOffset_);
 
+  // ---- Split-consistent cold curve ----
+  // PCold_/sieCold_/dPdRhoCold_ are loaded from the material's SHARED `coldCurve` group; only
+  // lTGroup carries the /electronOnly or /ionCold suffix, and the file holds no per-split cold
+  // curve.  So every OffBottom consumer (sieFromlRhoTlT_, PFromRholRhoTlT_,
+  // MinInternalEnergyFromDensity, ...) returned the TOTAL curve for a split table.
+  //
+  // MEASURED on the shipped V14/V12/V19 Al companions (pte_tools/probe_split_surface.cpp): at
+  // T = T_min all three splits returned an identical sie of -1.704800633e9, while at T >= 1 K
+  // they separated correctly (ElectronOnly +6.19e5, IonCold -1.705060e9).  In FLASH that put an
+  // ion-magnitude cold energy in the ELECTRON slot for any cell sitting at the table floor --
+  // Al's electron minimum is +684.9 -- which is what aborted RUN264/265/266 at step 3.  It was
+  // masked for as long as electrons carried the shared +4.09e9 shift, because the wrong value
+  // still stored positive.
+  //
+  // Anchor a split's cold curve on its OWN bottom row instead.  That is the table-consistent
+  // answer and needs no table rebuild.  Total keeps the file's curve, so unsplit use is
+  // bit-identical.  Done BEFORE setlTColdCrit_() so the crossing search below sees this curve.
+  if (split_ != TableSplit::Total) {
+    for (int j = 0; j < numRho_; j++) {
+      const Real lRho = sieCold_.range(0).x(j);
+      sieCold_(j) = sie_.interpToReal(lRho, lTMin_);
+      PCold_(j) = P_.interpToReal(lRho, lTMin_);
+      dPdRhoCold_(j) = dPdRho_.interpToReal(lRho, lTMin_);
+    }
+  }
+
   // bulk modulus can be wrong in the tables. Use FLAG's approach to
   // fix the table.
   fixBulkModulus_();
