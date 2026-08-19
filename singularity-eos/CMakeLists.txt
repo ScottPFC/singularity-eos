@@ -61,6 +61,7 @@ register_headers(
     eos/eos_type_lists.hpp
     eos/modifiers/relativistic_eos.hpp
     eos/modifiers/scaled_eos.hpp
+    eos/modifiers/sub_mixture_eos.hpp
     eos/modifiers/ramps_eos.hpp
     eos/modifiers/shifted_eos.hpp
     eos/modifiers/eos_unitsystem.hpp

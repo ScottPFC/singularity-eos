@@ -67,8 +67,14 @@ class SubMixtureEOS : public EosBase<SubMixtureEOS<T>> {
   PORTABLE_FUNCTION
   SubMixtureEOS(T &&t, const Real default_scale = 1.0, const std::size_t scale_idx = 0)
       : t_(std::forward<T>(t)), default_scale_(default_scale), scale_idx_(scale_idx) {
-    PORTABLE_ALWAYS_REQUIRE(default_scale_ > 0, "Default scale must be positive.");
-    PORTABLE_ALWAYS_REQUIRE(!std::isnan(default_scale_), "Default scale must be well defined.");
+    CheckParams();
+  }
+
+  PORTABLE_INLINE_FUNCTION void CheckParams() const {
+    PORTABLE_ALWAYS_REQUIRE(default_scale_ > 0, "Default sub-mixture scale must be positive.");
+    PORTABLE_ALWAYS_REQUIRE(!std::isnan(default_scale_),
+                            "Default sub-mixture scale must be well defined.");
+    t_.CheckParams();
   }
 
   auto GetOnDevice() {
