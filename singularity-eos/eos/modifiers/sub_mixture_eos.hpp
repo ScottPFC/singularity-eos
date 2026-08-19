@@ -237,6 +237,30 @@ class SubMixtureEOS : public EosBase<SubMixtureEOS<T>> {
     return t_.MaximumPressureAtTemperature(temp);
   }
 
+  // Mean atomic mass is a per-particle quantity, so it carries 1/S_eff -- for a D+T group that
+  // is exactly Mbar = M_D/S_eff, the composition-weighted mean the group represents. Atomic
+  // NUMBER is unchanged: the members are isotopes or rescalings, not different elements.
+  PORTABLE_INLINE_FUNCTION
+  Real MeanAtomicMass() const { return robust::ratio(t_.MeanAtomicMass(), default_scale_); }
+  PORTABLE_INLINE_FUNCTION
+  Real MeanAtomicNumber() const { return t_.MeanAtomicNumber(); }
+
+  template <typename Indexer_t = Real *>
+  PORTABLE_INLINE_FUNCTION Real MeanAtomicMassFromDensityTemperature(
+      const Real rho, const Real temperature,
+      Indexer_t &&lambda = static_cast<Real *>(nullptr)) const {
+    const Real s = Scale(lambda);
+    return robust::ratio(
+        t_.MeanAtomicMassFromDensityTemperature(s * rho, temperature, lambda), s);
+  }
+  template <typename Indexer_t = Real *>
+  PORTABLE_INLINE_FUNCTION Real MeanAtomicNumberFromDensityTemperature(
+      const Real rho, const Real temperature,
+      Indexer_t &&lambda = static_cast<Real *>(nullptr)) const {
+    const Real s = Scale(lambda);
+    return t_.MeanAtomicNumberFromDensityTemperature(s * rho, temperature, lambda);
+  }
+
   PORTABLE_INLINE_FUNCTION int nlambda() const noexcept { return t_.nlambda(); }
   template <typename Indexable>
   static inline constexpr bool NeedsLambda() {
@@ -248,11 +272,9 @@ class SubMixtureEOS : public EosBase<SubMixtureEOS<T>> {
            static_cast<long>(scale_idx_));
     t_.PrintParams();
   }
-  inline constexpr bool IsModified() const { return true; }
-  inline constexpr T UnmodifyOnce() { return t_; }
-  inline constexpr decltype(auto) GetUnmodifiedObject() {
-    return t_.GetUnmodifiedObject();
-  }
+  // IsModified / UnmodifyOnce / GetUnmodifiedObject come from the macro; defining them by hand
+  // as well is a redefinition, not an override.
+  SG_ADD_MODIFIER_METHODS(T, t_);
 
  private:
   T t_;
