@@ -88,15 +88,28 @@ static constexpr const auto scaled_of_shifted =
 // combined list of all scaled EOS
 static constexpr const auto scaled =
     singularity::variadic_utils::concat(scaled_1, scaled_of_shifted);
+// Sub-mixture groups: an ideal-solution set of alike species served as ONE material, with the
+// effective scale read per call from the lambda (sub_mixture_eos.hpp).
+//
+// Applied to `full_eos_list` ONLY, deliberately. This list is a combinatorial expansion --
+// crossing a new modifier with shifted/scaled/ramped would multiply the instantiation count and
+// the compile time with it. A group's base is a plain tabular EOS in every case we have: FLASH
+// applies its energy shift manually rather than through ShiftedEOS, and no group base carries a
+// ramp. If that changes, a group whose base is shifted or ramped will fail to construct at init
+// rather than silently misbehave.
+static constexpr const auto sub_mixed =
+    transform_variadic_list(full_eos_list, al<SubMixtureEOS>{});
 // create combined list
 static constexpr const auto combined_list_1 =
     singularity::variadic_utils::concat(full_eos_list, shifted, scaled);
 // make a ramped eos of everything
 static constexpr const auto ramped_all =
     transform_variadic_list(combined_list_1, al<BilinearRampEOS>{});
-// final combined list
+// final combined list. `sub_mixed` is concatenated HERE rather than into combined_list_1 so it
+// stays out of the ramp cross product above: a ramped sub-mixture group is not something we
+// build, and the expansion is exactly what costs compile time.
 static constexpr const auto combined_list =
-    singularity::variadic_utils::concat(combined_list_1, ramped_all);
+    singularity::variadic_utils::concat(combined_list_1, ramped_all, sub_mixed);
 
 } // namespace singularity
 
