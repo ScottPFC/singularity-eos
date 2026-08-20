@@ -45,7 +45,30 @@
 namespace singularity {
 namespace spiner_common {
 
-static constexpr int NGRIDS = 3;
+// Maximum PATCHES per axis in a piecewise grid. Raised 3 -> 8 (2026-08-19).
+//
+// This is a fixed-array bound, not a physical limit: PiecewiseGrid1D holds
+// `RegularGrid1D<T> grids_[NGRIDS]` plus `int pointTotals_[NGRIDS]`, and a RegularGrid1D is
+// four Reals and an int -- about 44 bytes per slot, per axis, per grid object. Going 3 -> 8
+// costs ~220 bytes an axis, a few KB across a whole run. The array is fixed-size for device
+// portability (no dynamic allocation on GPU), not because the count matters. Spiner's own
+// default is 5.
+//
+// Why raise it: 3 patches leaves real table savings on the table. Coarsening the TEMPERATURE
+// axis of V23 (fraction of the table over 5% relative error on P, rho untouched, Al being the
+// binding material) measures
+//
+//     n_T=256   K=1 0.196%   K=4 0.109%   K=6 0.025%
+//     n_T=384   K=1 0.020%   K=4 0.000%
+//
+// so 6 patches at n_T=256 beats a uniform axis at 384 using a third fewer points -- 3.7x
+// against 2.4x. The cap also bound the DENSITY axis, which already spends all 3 patches on
+// V23's cold-knee refinement and so could not be refined further either.
+//
+// A table with more patches than this loads and then aborts in piecewise_grid_1d.hpp with
+// "Total number of grids must be within maximum allowed", so this must be raised BEFORE
+// building any table that uses the extra patches.
+static constexpr int NGRIDS = 8;
 using Grid_t = Spiner::PiecewiseGrid1D<Real, NGRIDS>;
 using DataBox = Spiner::DataBox<Real, Grid_t>;
 

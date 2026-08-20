@@ -64,9 +64,12 @@ class SubMixtureEOS : public EosBase<SubMixtureEOS<T>> {
   static std::string EosPyType() { return std::string("SubMixture") + T::EosPyType(); }
 
   SubMixtureEOS() = default;
+  //! `scale_lo`/`scale_hi` bracket every S_eff the group can ever present -- see MinimumDensity.
   PORTABLE_FUNCTION
-  SubMixtureEOS(T &&t, const Real default_scale = 1.0, const std::size_t scale_idx = 0)
-      : t_(std::forward<T>(t)), default_scale_(default_scale), scale_idx_(scale_idx) {
+  SubMixtureEOS(T &&t, const Real default_scale = 1.0, const std::size_t scale_idx = 0,
+                const Real scale_lo = 1.0, const Real scale_hi = 1.0)
+      : t_(std::forward<T>(t)), default_scale_(default_scale), scale_idx_(scale_idx),
+        scale_lo_(scale_lo), scale_hi_(scale_hi) {
     CheckParams();
   }
 
@@ -74,22 +77,35 @@ class SubMixtureEOS : public EosBase<SubMixtureEOS<T>> {
     PORTABLE_ALWAYS_REQUIRE(default_scale_ > 0, "Default sub-mixture scale must be positive.");
     PORTABLE_ALWAYS_REQUIRE(!std::isnan(default_scale_),
                             "Default sub-mixture scale must be well defined.");
+    PORTABLE_ALWAYS_REQUIRE(scale_lo_ > 0 && scale_hi_ >= scale_lo_,
+                            "Sub-mixture scale bracket must be positive and ordered.");
     t_.CheckParams();
   }
 
   auto GetOnDevice() {
-    return SubMixtureEOS<T>(t_.GetOnDevice(), default_scale_, scale_idx_);
+    return SubMixtureEOS<T>(t_.GetOnDevice(), default_scale_, scale_idx_, scale_lo_, scale_hi_);
   }
   inline void Finalize() { t_.Finalize(); }
 
-  // S_eff for this call. A non-positive or NaN value in the lambda is REFUSED rather than
-  // propagated: it would otherwise reach the tables as a negative density and come back as a
+  // S_eff for this call. Anything outside [scale_lo_, scale_hi_] is REFUSED rather than
+  // propagated: it would otherwise reach the tables as a wrong density and come back as a
   // plausible number with no error signal.
+  //
+  // The bracket, not just positivity, is the test. S_eff is a mass-fraction weighted mean of the
+  // members' scales, so it CANNOT leave [min_m s_m, max_m s_m] -- a value outside is proof the
+  // lambda slot was not the one FLASH wrote. That is not hypothetical: `SubMixLambda` decays to
+  // `double*` for EOSs that declare `Real *lambda` concretely (BilinearRampEOS, which the PTE
+  // solvers call), and on that path the TYPED accessor is unavailable and SafeGet falls back to
+  // the numeric `scale_idx_`. When that index was off by one it landed on the next material's
+  // slot 0 -- SpinerEOSDependsRhoSie's cached log-density -- which is positive often enough to
+  // sail through a bare `s > 0` guard and silently probe the base at several times the true
+  // density. A bracket check turns that into a correct fallback instead of a wrong answer.
   template <typename Indexer_t>
   PORTABLE_FORCEINLINE_FUNCTION Real Scale(Indexer_t &&lambda) const {
     Real s = default_scale_;
     IndexerUtils::SafeGet<IndexableTypes::SubMixtureScale>(lambda, scale_idx_, s);
-    return (s > 0.0 && !std::isnan(s)) ? s : default_scale_;
+    if (std::isnan(s) || s < scale_lo_ || s > scale_hi_) return default_scale_;
+    return s;
   }
 
   template <typename Indexer_t = Real *>
@@ -223,13 +239,27 @@ class SubMixtureEOS : public EosBase<SubMixtureEOS<T>> {
     sie *= s;
   }
 
-  // Bounds are reported at the DEFAULT scale. They are used to size grids and brackets, not to
-  // answer a query, and a per-call scale has no meaning without a lambda to read it from.
+  // Density bounds take NO lambda, so they cannot know the cell's S_eff -- but they do not need
+  // to. S_eff = sum_m Y_m s_m is a weighted MEAN of the member scales, so for ANY composition it
+  // lies in [min_m s_m, max_m s_m]. The group at density rho is evaluated at S_eff*rho, so its
+  // reachable density range is bounded exactly by
+  //
+  //     [ base_min / scale_hi ,  base_max / scale_lo ]
+  //
+  // which is correct for every composition rather than for one nominal one.
+  //
+  // The direction matters. `PTESolverBase` clamps with `min(rho[m], MaximumDensity())`, so a
+  // bound that is too SMALL forces a legitimate state down and pushes the solve off-manifold;
+  // one that is merely loose lets the base EOS clamp internally, exactly as an ungrouped
+  // material would. Reporting the DEFAULT scale here made the D+T group's maximum 25% too low
+  // and produced 26,566 "PTE result OFF-MANIFOLD (accepted despite converged flag)" with a
+  // timestep collapse from 5.6e-12 to 2.6e-14 s; the identity group, where the bracket is
+  // degenerate, logged none.
   PORTABLE_INLINE_FUNCTION Real MinimumDensity() const {
-    return robust::ratio(t_.MinimumDensity(), default_scale_);
+    return robust::ratio(t_.MinimumDensity(), scale_hi_);
   }
   PORTABLE_INLINE_FUNCTION Real MaximumDensity() const {
-    return robust::ratio(t_.MaximumDensity(), default_scale_);
+    return robust::ratio(t_.MaximumDensity(), scale_lo_);
   }
   PORTABLE_INLINE_FUNCTION Real MinimumTemperature() const { return t_.MinimumTemperature(); }
   PORTABLE_INLINE_FUNCTION Real MinimumPressure() const { return t_.MinimumPressure(); }
@@ -280,6 +310,9 @@ class SubMixtureEOS : public EosBase<SubMixtureEOS<T>> {
   T t_;
   Real default_scale_;
   std::size_t scale_idx_;
+  //! Smallest and largest member scale; brackets every S_eff the group can present.
+  Real scale_lo_;
+  Real scale_hi_;
 };
 
 } // namespace singularity

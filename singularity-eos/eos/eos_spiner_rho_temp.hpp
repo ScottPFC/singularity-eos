@@ -568,10 +568,36 @@ inline herr_t SpinerEOSDependsRhoT::loadDataboxes_(const std::string &matid_str,
   status += bMod_.loadHDF(lTGroup, SP5::Fields::bMod);
   status += dPdRho_.loadHDF(lTGroup, SP5::Fields::dPdRho);
   status += dPdE_.loadHDF(lTGroup, SP5::Fields::dPdE);
-  status += dTdRho_.loadHDF(lTGroup, SP5::Fields::dTdRho);
-  status += dTdE_.loadHDF(lTGroup, SP5::Fields::dTdE);
   status += dEdRho_.loadHDF(lTGroup, SP5::Fields::dEdRho);
   status += dEdT_.loadHDF(lTGroup, SP5::Fields::dEdT);
+
+  // dTdE and dTdRho are ALGEBRAIC consequences of dEdT and dEdRho:
+  //
+  //     dTdE = 1 / dEdT              dTdRho = -dEdRho / dEdT
+  //
+  // Checked against the shipped V23 tables (Cu and DD) the identities hold to EXACTLY zero
+  // relative error, median and max, so a table may omit both and save 2 of the 9 (rho,T)
+  // fields -- 22% of the group, and 22% of the largest thing in the set.
+  //
+  // The analytic values are still PREFERRED whenever the table carries them, so this changes
+  // nothing for existing tables and commits us to neither choice: a build that wants the
+  // tabulated partials simply keeps emitting them.
+  if (H5Lexists(lTGroup, SP5::Fields::dTdE, H5P_DEFAULT) > 0) {
+    status += dTdE_.loadHDF(lTGroup, SP5::Fields::dTdE);
+  } else {
+    dTdE_.copyMetadata(dEdT_);
+    for (int i = 0; i < dTdE_.size(); ++i) {
+      dTdE_.data()[i] = robust::ratio(1.0, dEdT_.data()[i]);
+    }
+  }
+  if (H5Lexists(lTGroup, SP5::Fields::dTdRho, H5P_DEFAULT) > 0) {
+    status += dTdRho_.loadHDF(lTGroup, SP5::Fields::dTdRho);
+  } else {
+    dTdRho_.copyMetadata(dEdT_);
+    for (int i = 0; i < dTdRho_.size(); ++i) {
+      dTdRho_.data()[i] = -robust::ratio(dEdRho_.data()[i], dEdT_.data()[i]);
+    }
+  }
 
   // cold curves
   status += PCold_.loadHDF(coldGroup, SP5::Fields::P);

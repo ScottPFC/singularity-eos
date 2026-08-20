@@ -61,6 +61,17 @@ struct MixParams {
   Real pte_abs_tolerance_p_sufficient = 1.e2 * pte_abs_tolerance_p;
   Real pte_abs_tolerance_t_sufficient = 10 * pte_abs_tolerance_t;
 
+  // Energy-residual normaliser for the cyclic (rho,e) solve.
+  //   0 (default) -- legacy `1 + |sie_tot|`.  `sie_tot` carries FLASH's uniform energy shift and
+  //                  the table's binding-energy zero, both ARBITRARY, so the accepted absolute
+  //                  error depends on a gauge rather than on physics.  Measured on the shipped
+  //                  V22 tables it is ~650x the physical energy scale at cold copper.
+  //   1           -- gauge-invariant `max(P*tau, floor)`: a pressure-work energy scale built only
+  //                  from physical quantities, so no arbitrary zero enters.  MUCH tighter (~550x
+  //                  at cold copper), so it is opt-in until measured.
+  int pte_energy_norm = 0;
+  Real pte_energy_norm_floor = 1.0e-30;
+
   std::size_t pte_max_iter_per_mat = 128;
   Real line_search_alpha = 1.e-2;
   std::size_t line_search_max_iter = 6;
