@@ -310,12 +310,19 @@ PTESolveCyclicRhoE(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_to
   auto mix = [&](const Real P, const Real T, Real &tau, Real &energy) {
     MixtureTauE(nmat, eos, Ym, lambda, P, T, tau, energy);
   };
+  // Energy normaliser -- see MixParams::pte_energy_norm.  The legacy `1 + |sie_tot|` scales with
+  // an ARBITRARY zero (FLASH's uniform shift plus the table's binding-energy reference), so the
+  // same physical state converges to a different absolute accuracy depending on a gauge.  Mode 1
+  // uses P*tau, a pressure-work scale built only from physical quantities.
   auto residual_of = [&](const Real P, const Real T) {
     Real tau, energy;
     mix(P, T, tau, energy);
     if (!std::isfinite(tau)) return std::numeric_limits<Real>::infinity();
+    const Real e_scale = (params.pte_energy_norm == 1)
+                             ? std::max(std::abs(P * tau), params.pte_energy_norm_floor)
+                             : (1.0 + std::abs(sie_tot));
     return std::max(std::abs(tau - tau_target) / tau_target,
-                    std::abs(energy - sie_tot) / (1.0 + std::abs(sie_tot)));
+                    std::abs(energy - sie_tot) / e_scale);
   };
 
   Real T = std::min(std::max(Tguess, t_lo), t_hi);

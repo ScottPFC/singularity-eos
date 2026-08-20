@@ -523,6 +523,12 @@ PORTABLE_INLINE_FUNCTION void
 TableDependsPT::DensityEnergyDerivativesFromPressureTemperature(
     const Real press, const Real temp, Indexer_t &&, Real &rho, Real &sie, Real &drho_dP,
     Real &drho_dT, Real &de_dP, Real &de_dT) const {
+  // This counter was DECLARED and never incremented, so every report read "deriv 0" -- an
+  // instrumentation gap that reads exactly like "the dual solver's Newton path never runs".
+  // It is the Newton step's accessor, so it is also the measurement that sizes any batching /
+  // vectorisation of the PTE solve: derivPT/PTE-cell is the Newton work, directPT the safeguard
+  // and seed work, and without the split there is no way to tell which one to batch.
+  ++sg_pt_acct::derivPT();
   const Real p = std::min(std::max(press, Pmin_), Pmax_);
   const Real t = std::min(std::max(temp, Tmin_), Tmax_);
   const int i = cell_(P_, numP_, p);
