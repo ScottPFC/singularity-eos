@@ -312,7 +312,12 @@ PTESolveDual(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_tot, con
   for (std::size_t m = 1; m < nmat; ++m) {
     p_lo = std::max(p_lo, eos[m].MinimumPressure());
     p_hi = std::min(p_hi, eos[m].MaximumPressureAtTemperature(Tguess));
-    t_lo = std::min(t_lo, eos[m].MinimumTemperature());
+    // MAX, not min: the lowest temperature at which the MIXTURE is evaluable is the one at
+    // which EVERY material is still on its own table, so the aggregate floor is the LARGEST of
+    // the per-material minimums. Taking the min admits a box whose cold end lies on only the
+    // most permissive material's table and extrapolates all the others. The Fortran twin,
+    // `pte_cold_floor` in eos_singularity.F90, has always computed the max.
+    t_lo = std::max(t_lo, eos[m].MinimumTemperature());
   }
   const Real t_hi = params.temperature_limit;
   if (!(p_hi > 0.0) || !(t_hi > t_lo)) return status;
@@ -321,7 +326,25 @@ PTESolveDual(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_tot, con
   // The Newton iterate is clamped to a strictly positive box: gamma = P/T is a conjugate
   // variable, not a coordinate that may pass through zero.
   const Real p_lo_clamp = std::max(p_lo, 1.0e-300);
-  const Real t_lo_clamp = std::max(t_lo, 1.0e-300);
+  // ⚠ CLAMP THE TEMPERATURE ITERATE TO THE TABLE FLOOR, NOT TO 1e-300.
+  //
+  // `1e-300` is a POSITIVITY guard -- it exists so `gamma = P/T` stays finite -- and it was
+  // doing duty as the PHYSICAL bound. That let the Newton iterate settle 298 decades below the
+  // tables. MEASURED on FLASH trapdoor RUN007 (23,548 steps), four cells came back at
+  // `T = 1.0000000000000000E-300` against a coldest tabulated isotherm of 1.0041e-02 K, with
+  // `press = Infinity` for every material while the volume and energy residuals had converged
+  // to 3.7e-07 and 8.9e-07 -- a CONVERGED solve carrying an infinite pressure.
+  //
+  // Downstream that was unrecoverable: `P_spread` came out NaN (from `Inf - Inf`), and a NaN
+  // passes every `resid >= threshold` gate because Fortran comparisons against NaN are false,
+  // so the state was ACCEPTED and killed the run four steps later in `hy_uhd_eigenParameters`
+  // with an imaginary sound speed.
+  //
+  // `t_lo_bracket` is the same quantity the bracketing arms already use and is strictly
+  // positive by construction (`>= 1e-8`), so it still satisfies the conjugate-variable
+  // requirement the 1e-300 guard was written for, while also being a temperature the tables can
+  // actually represent.
+  const Real t_lo_clamp = t_lo_bracket;
 
   auto mix = [&](const Real P, const Real T, Real &tau, Real &energy) {
     MixtureTauE(nmat, eos, Ym, lambda, P, T, tau, energy);
