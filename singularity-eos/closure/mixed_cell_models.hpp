@@ -78,6 +78,25 @@ struct MixParams {
   Real line_search_fac = 0.5;
   Real vfrac_safety_fac = 0.95;
   Real temperature_limit = 1.0e15;
+  // PTESolveDual switches.  The defaults are the fixed solver; setting all four to
+  // {false, false, 0, false} reproduces the pre-fix PTESolveDual bit for bit.
+  //
+  // When the recession heuristic fires, confirm it with the exact finite-box test -- one volume
+  // solve at the temperature bound the energy residual drives T to -- and decline only on that
+  // proof.  false restores the heuristic-only decline.
+  bool pte_dual_exact_certificate = true;
+  // The safeguard's fixed-P temperature sub-solve roots the ENTHALPY residual h = r_e + P r_tau
+  // (the exact maximiser of J on the fixed-P ray) and pairs it with the isenthalp tangent.  false
+  // keeps PTESolveCyclicRhoE's isoenergetic step and tangent.
+  bool pte_dual_enthalpy_tstep = true;
+  // With the enthalpy step: after two consecutive safeguard steps whose residual ratio exceeds
+  // this, fall back to the energy step for the rest of the solve.  0 disables the fallback.
+  Real pte_dual_enthalpy_slow_ratio = 0.7;
+  // The safeguard's three boundary corrections: an empty coordinate bracket steps to the box end
+  // the monotone residual points to, a tangent intersection that clamps back onto the current
+  // iterate is rejected, and the pressure bracket is floored at the EOS box minimum rather than
+  // at 1 barye.  false is the legacy safeguard, kept only to reproduce old results.
+  bool pte_dual_safeguard_fixes = true;
   Real default_tguess = 300.;
   Real min_dtde = 1.0e-16;
   std::size_t pte_small_step_tries = 2;
@@ -119,7 +138,23 @@ struct SolverStatus {
   // contract the residual (PTESolveDual only).  Zero means the solve ran at pure-Newton cost, so
   // this is the diagnostic that says whether a cell needed the safeguard at all.
   std::size_t safeguard_iters = 0;
+  // PTESolveDual only.  Largest relative asymmetry of the assembled Hessian's cross term over the
+  // solve, |Xi_bg(e) - Xi_bg(tau)| / sqrt|Xi_bb Xi_gg|: 0 for a thermodynamically consistent EOS,
+  // so it is a runtime check on the table's Maxwell consistency.
+  Real max_asymmetry = 0.0;
+  // PTESolveDual only.  What the admissibility test concluded, if it ran (DualAdmissibility).
+  int admissibility = 0;
   Real residual;
+};
+
+// Outcome of PTESolveDual's admissibility test.  The heuristic (T railed at a bound, or a
+// same-sign stalled energy residual) only NOMINATES a cell; the exact check decides it.
+enum DualAdmissibility : int {
+  kAdmissibilityNotTested = 0,
+  kAdmissibilityUnreachable = 1, // proven: g0(T_bound) is on the wrong side of e0 -> declined
+  kAdmissibilityReachable = 2,   // proven: a state exists, the heuristic was wrong -> continued
+  kAdmissibilityUndecided = 3,   // no volume root at T_bound inside the P box -> continued
+  kAdmissibilityHeuristic = 4,   // exact check disabled; declined on the heuristic alone
 };
 
 namespace mix_impl {

@@ -30,10 +30,12 @@
 // Symmetry is what makes the Newton direction d = -H^-1 R a descent direction on ||R||^2:
 // grad(merit).d = -R^T W^2 R < 0 needs H^T H^-1 = I, i.e. H symmetric.
 //
-// THE CYCLIC METHOD IS THE SAME PROGRAM.  PTESolveCyclicRhoE's two bracketed sub-solves are exact
-// block-coordinate maximisations of this same J: the isochoric solve is dJ/dgamma = 0 and the
-// isoenergetic one is dJ/dbeta = 0.  Each is bracketable because each residual is strictly
-// monotone in its own coordinate -- d2J/dgamma2 < 0 <=> K_T > 0, and d2J/dbeta2 < 0 <=> c_v > 0.
+// THE SAFEGUARD IS COORDINATE ASCENT ON THE SAME J, in (P, T).  The fixed-T pressure solve holds
+// beta and roots dJ/dgamma = r_tau, monotone because K_T > 0.  The fixed-P temperature solve moves
+// along the ray gamma = P*beta and roots dJ/dbeta along it, which is the ENTHALPY residual
+// h = r_e + P r_tau, monotone because c_p > 0.  Both roots are exact line maximisers of a concave
+// J, so both brackets always exist.  PTESolveCyclicRhoE's isoenergetic step 2 roots r_e at fixed
+// P instead, which is neither stationary on that line nor guaranteed monotone.
 // "The bracket IS the robustness" is coordinatewise concavity.  So the two are not rivals but the
 // textbook pair: coordinate ascent is globally convergent and derivative-free, Newton is locally
 // quadratic, and a step of either may be taken at any time without leaving the theory.
@@ -43,7 +45,8 @@
 //
 // ⚠️ TWO RULES, BOTH MEASURED, NEITHER OBVIOUS -- do not "simplify" either away:
 //
-//   a. The coordinate step is accepted UNCONDITIONALLY.  It always increases J, but it may raise
+//   a. The coordinate step is accepted UNCONDITIONALLY.  Its two sub-solves each increase J (the
+//      tangent intersection, taken only when it lowers ||R||, need not), but it may raise
 //      ||R|| on the way, and gating it on the residual discards precisely the property being
 //      borrowed.  Measured offline on the RUN102 interface cell (Cu+DD+TT, rho=0.2483, T=19.47),
 //      64 seeds over the box: 1.6% converged with a ||R|| gate, 65.6% without.
@@ -321,7 +324,10 @@ PTESolveDual(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_tot, con
   }
   const Real t_hi = params.temperature_limit;
   if (!(p_hi > 0.0) || !(t_hi > t_lo)) return status;
-  const Real p_lo_bracket = std::max(p_lo, 1.0);
+  // The pressure bracket floor is the EOS box minimum, so an equilibrium below 1 barye stays
+  // reachable.  The legacy safeguard (pte_dual_safeguard_fixes = false) floors it at 1 barye.
+  const bool safeguard_fixes = params.pte_dual_safeguard_fixes;
+  const Real p_lo_bracket = safeguard_fixes ? std::max(p_lo, 1.0e-300) : std::max(p_lo, 1.0);
   const Real t_lo_bracket = std::max(t_lo, 1.0e-8);
   // The Newton iterate is clamped to a strictly positive box: gamma = P/T is a conjugate
   // variable, not a coordinate that may pass through zero.
@@ -442,11 +448,48 @@ PTESolveDual(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_tot, con
   Real max_asymmetry = state.valid ? state.asymmetry : 0.0;
   std::size_t iters = 0;
   std::size_t safeguard_steps = 0;
+  // The enthalpy T-step is exact coordinate ascent in (P, T), and on a two-phase plateau that
+  // ZIG-ZAGS at a linear rate (measured on V44 Al+Cu dome cells: 0.76 at the median, ~0.94 at
+  // p90), where the energy step's tangent escapes.  With pte_dual_enthalpy_slow_ratio > 0, two
+  // consecutive safeguard steps that each leave the residual above that fraction of its previous
+  // value switch the rest of the solve to the energy step.
+  bool enthalpy_active = params.pte_dual_enthalpy_tstep;
+  int slow_safeguard_streak = 0;
   // Recession-direction detector; see the loop body for what it certifies.
   int recession = 0;
   int sign_streak = 0;
   Real previous_energy_residual = state.residual_energy;
   Real previous_temperature = T;
+  int admissibility = kAdmissibilityNotTested;
+
+  // ---- The exact finite-box admissibility test ----
+  //
+  // g0(T) = sum_m Y_m e_m(P(tau0, T), T), with P(tau0, T) the volume root at fixed T.  Along that
+  // isochore g0'(T) = c_v > 0, so g0(T_min) > e0 proves that no state with T >= T_min reaches e0,
+  // and g0(T_max) < e0 that none with T <= T_max does.  The margin is taken in the stopping
+  // test's own units: a target within `tol` of g0(T_min) is one the solver may still converge
+  // on the floor isotherm, so it is not declined.
+  //
+  // The result depends on (tau0, e0, Y) and the box only, never on the iterate, so it is
+  // evaluated at most once per solve: the heuristic above only NOMINATES a cell, this decides
+  // it.  Cost: one bracketed volume root plus one mixture evaluation.
+  auto exact_admissibility = [&](const bool too_hot) -> int {
+    const Real T_b = too_hot ? t_lo_clamp : t_hi;
+    const auto tau_resid = [&](const Real p) {
+      Real tau, energy;
+      mix(p, T_b, tau, energy);
+      return tau - tau_target;
+    };
+    Real P_b;
+    if (!LogBracketRoot(p_lo_bracket, p_hi, tau_resid, P_b, 1.0e-12))
+      return kAdmissibilityUndecided;
+    Real tau_b, e_b;
+    mix(P_b, T_b, tau_b, e_b);
+    if (!std::isfinite(e_b)) return kAdmissibilityUndecided;
+    const Real margin = (e_b - sie_tot) / (1.0 + std::abs(sie_tot));
+    const bool unreachable = too_hot ? (margin > tol) : (margin < -tol);
+    return unreachable ? kAdmissibilityUnreachable : kAdmissibilityReachable;
+  };
 
   while (iters < max_iter && max_norm_of(state) > tol) {
     ++iters;
@@ -493,7 +536,17 @@ PTESolveDual(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_tot, con
     } else {
       recession = 0;
     }
-    if ((recession >= 2 || sign_streak >= 3) && safeguard_steps >= 1) break;
+    // The heuristic NOMINATES; the exact test above decides, once.  A cell it proves reachable
+    // (or cannot decide) is never nominated again in this solve.
+    if ((recession >= 2 || sign_streak >= 3) && safeguard_steps >= 1 &&
+        admissibility == kAdmissibilityNotTested) {
+      if (!params.pte_dual_exact_certificate) {
+        admissibility = kAdmissibilityHeuristic;
+        break;
+      }
+      admissibility = exact_admissibility(state.residual_energy > 0.0);
+      if (admissibility == kAdmissibilityUnreachable) break;
+    }
     Real d_beta, d_gamma;
     if (!state.valid || !NewtonDirection(state, beta, gamma, d_beta, d_gamma)) break;
 
@@ -542,10 +595,10 @@ PTESolveDual(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_tot, con
     }
     if (accepted) continue;
 
-    // Safeguard: one block-coordinate maximisation of the same J, by bracketed bisection.  Both
-    // roots exist and are unique because each residual is strictly monotone in its own coordinate
-    // (K_T > 0 and c_v > 0).  Aim the sub-solves at the residual still to be removed, as
-    // PTESolveCyclicRhoE does; an exact coordinate root is waste while the other is far off.
+    // Safeguard: one block-coordinate maximisation of the same J in (P, T), by bracketed roots.
+    // Both roots exist and are unique because each residual is strictly monotone in its own
+    // coordinate (K_T > 0 and c_p > 0).  Aim the sub-solves at the residual still to be removed,
+    // as PTESolveCyclicRhoE does; an exact coordinate root is waste while the other is far off.
     const Real sub_tol = std::min(std::max(1.0e-3 * std::sqrt(2.0 * merit), 1.0e-12), 1.0e-3);
     Real step_P = gamma / beta;
     Real step_T = 1.0 / beta;
@@ -555,13 +608,37 @@ PTESolveDual(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_tot, con
       return tau - tau_target;
     };
     Real root;
-    if (LogBracketRoot(p_lo_bracket, p_hi, tau_resid, root, sub_tol)) step_P = root;
-    const auto e_resid = [&](const Real t) {
+    // An empty bracket means the residual keeps one sign over the whole box, and J restricted to
+    // the coordinate is then maximised at the box end that sign points to: the PROJECTED
+    // coordinate maximiser.  tau - tau0 decreases with P, so all-negative is the low end.
+    // Leaving the coordinate where it was instead (the legacy safeguard) stalls the solve at the
+    // box boundary with "did not move".
+    if (LogBracketRoot(p_lo_bracket, p_hi, tau_resid, root, sub_tol)) {
+      step_P = root;
+    } else if (safeguard_fixes) {
+      const Real r_lo = tau_resid(p_lo_bracket);
+      if (std::isfinite(r_lo)) step_P = (r_lo < 0.0) ? p_lo_bracket : p_hi;
+    }
+    // The fixed-P temperature solve moves along the ray gamma = P*beta, on which
+    //     dJ/dbeta = r_e + P r_tau = sum Y (e + P tau) - (e0 + P tau0) = h,
+    // Clayton's ENTHALPY residual, with dh/dT|_P = c_p > 0.  Its root is the exact maximiser of J
+    // on the ray and a bracket always exists.  The ENERGY residual (PTESolveCyclicRhoE's step 2)
+    // is not stationary on the ray, and (de/dT)_P = c_p - P tau alpha_P can change sign.
+    // Runtime switch MixParams::pte_dual_enthalpy_tstep; false is PTESolveCyclicRhoE's energy step.
+    const bool enthalpy_tstep = enthalpy_active;
+    const auto t_resid = [&](const Real t) {
       Real tau, energy;
       mix(step_P, t, tau, energy);
+      if (enthalpy_tstep) return (energy - sie_tot) + step_P * (tau - tau_target);
       return energy - sie_tot;
     };
-    if (LogBracketRoot(t_lo_bracket, t_hi, e_resid, root, sub_tol)) step_T = root;
+    // Both T residuals increase with T, so all-positive projects to the low end.
+    if (LogBracketRoot(t_lo_bracket, t_hi, t_resid, root, sub_tol)) {
+      step_T = root;
+    } else if (safeguard_fixes) {
+      const Real r_lo = t_resid(t_lo_bracket);
+      if (std::isfinite(r_lo)) step_T = (r_lo > 0.0) ? t_lo_bracket : t_hi;
+    }
     step_P = std::min(std::max(step_P, p_lo_clamp), p_hi);
     step_T = std::min(std::max(step_T, t_lo_clamp), t_hi);
 
@@ -587,16 +664,31 @@ PTESolveDual(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_tot, con
       const DualState at_p =
           MixtureDual(nmat, eos, Ym, lambda, tau_target, sie_tot, step_P, 1.0 / beta, nullptr,
                       nullptr);
-      const DualState at_t =
-          MixtureDual(nmat, eos, Ym, lambda, tau_target, sie_tot, gamma / beta, step_T, nullptr,
-                      nullptr);
+      // Line B belongs to the temperature step.
+      //   energy step:   PTESolveCyclicRhoE's isoenergetic line, anchored at (P_now, step_T).
+      //                  That solver's sub-solves are Jacobi, so its root is there; these are
+      //                  Gauss-Seidel, so it is not -- kept for bit-compatibility.
+      //   enthalpy step: the ISENTHALP h = 0 through (step_P, step_T), where that step left
+      //                  h = 0 -- the tangent that belongs to it.
+      const bool isenthalp = enthalpy_tstep;
+      const Real P_line = isenthalp ? step_P : gamma / beta;
+      const DualState at_t = MixtureDual(nmat, eos, Ym, lambda, tau_target, sie_tot, P_line,
+                                         step_T, nullptr, nullptr);
       if (at_p.valid && at_t.valid) {
         const Real m_rho = (at_p.dtau_dP != 0.0) ? -at_p.dtau_dT / at_p.dtau_dP : 0.0;
-        const Real inv_m_e = (at_t.de_dT != 0.0) ? -at_t.de_dP / at_t.de_dT : 0.0;
+        // For the isenthalp: dh/dP|_T = e_P + r_tau + P tau_P and dh/dT|_P = c_p = e_T + P tau_T.
+        const Real h_T = at_t.de_dT + P_line * at_t.dtau_dT;
+        const Real h_P = at_t.de_dP + at_t.residual_tau + P_line * at_t.dtau_dP;
+        Real inv_m_e = (at_t.de_dT != 0.0) ? -at_t.de_dP / at_t.de_dT : 0.0;
+        if (isenthalp) inv_m_e = (h_T != 0.0) ? -h_P / h_T : 0.0;
         const Real ab = m_rho * inv_m_e;
-        if (std::isfinite(ab) && std::abs(1.0 - ab) > 1.0e-300) {
-          const Real T_now = 1.0 / beta, P_now = gamma / beta;
-          const Real t_int = (step_T + inv_m_e * (step_P - P_now) - ab * T_now) / (1.0 - ab);
+        Real t_line = step_T;
+        if (isenthalp && h_T != 0.0)
+          t_line = step_T - (at_t.residual_energy + P_line * at_t.residual_tau) / h_T;
+        if (std::isfinite(ab) && std::abs(1.0 - ab) > 1.0e-300 && std::isfinite(t_line)) {
+          const Real T_now = 1.0 / beta;
+          // Line A: P = step_P + m_rho (T - T_now);  line B: T = t_line + inv_m_e (P - P_line).
+          const Real t_int = (t_line + inv_m_e * (step_P - P_line) - ab * T_now) / (1.0 - ab);
           const Real p_int = step_P + m_rho * (t_int - T_now);
           const Real p_c = std::min(std::max(p_int, p_lo_clamp), p_hi);
           const Real t_c = std::min(std::max(t_int, t_lo_clamp), t_hi);
@@ -614,7 +706,12 @@ PTESolveDual(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_tot, con
                                      : std::numeric_limits<Real>::infinity();
               // Take the intersection only when it beats the plain sub-solve pair, exactly as
               // the cyclic arm does; otherwise keep (p_tilde, t_tilde).
-              if (r_int < r_sub) {
+              // An intersection that clamps back onto the current iterate is no step at all: taking
+              // it ends the solve as "did not move" (the legacy safeguard's box-corner stall), so
+              // keep the sub-solves' ascent step instead.
+              const bool back_home =
+                  safeguard_fixes && p_c == gamma / beta && t_c == 1.0 / beta;
+              if (r_int < r_sub && !back_home) {
                 step_P = p_c;
                 step_T = t_c;
               }
@@ -624,7 +721,7 @@ PTESolveDual(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_tot, con
       }
     }
 
-    // Accept it UNCONDITIONALLY when it is finite and it moved.  It always increases J, but it
+    // Accept it UNCONDITIONALLY when it is finite and it moved.  Its sub-solves increase J, but it
     // may raise ||R|| on the way, and gating it on the residual throws away exactly the property
     // being borrowed (measured: 1.6% of seeds converged with such a gate, 65.6% without).
     const bool moved = (step_P != gamma / beta) || (step_T != 1.0 / beta);
@@ -632,6 +729,13 @@ PTESolveDual(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_tot, con
                                           step_T, rho_try, sie_try);
     const Real stepped_merit = merit_of(stepped);
     if (!moved || !std::isfinite(stepped_merit)) break;
+    if (enthalpy_active && params.pte_dual_enthalpy_slow_ratio > 0.0) {
+      const Real ratio = std::sqrt(stepped_merit / merit);
+      slow_safeguard_streak = (ratio > params.pte_dual_enthalpy_slow_ratio)
+                                  ? slow_safeguard_streak + 1
+                                  : 0;
+      if (slow_safeguard_streak >= 2) enthalpy_active = false;
+    }
     beta = 1.0 / step_T;
     gamma = step_P * beta;
     state = stepped;
@@ -650,6 +754,8 @@ PTESolveDual(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_tot, con
   status.residual = residual;
   status.max_niter = iters;
   status.safeguard_iters = safeguard_steps;
+  status.max_asymmetry = max_asymmetry;
+  status.admissibility = admissibility;
   status.converged = std::isfinite(residual) && residual <= tol;
   if (status.converged) {
     // From the CACHE: `state` was produced by an evaluation at exactly this (P, T), so re-querying

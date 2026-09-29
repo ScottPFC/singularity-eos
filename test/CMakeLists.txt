@@ -60,6 +60,7 @@ if (SINGULARITY_BUILD_CLOSURE)
     closure_unit_tests
     catch2_define.cpp
     test_closure_pte.cpp
+    test_pte_dual_fixes.cpp
     test_kpt_models.cpp
     test_solver_utils.cpp
     )
