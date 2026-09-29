@@ -121,6 +121,11 @@ if(SINGULARITY_BUILD_CLOSURE)
     singularity-eos::singularity-eos)
   catch_discover_tests(closure_unit_tests PROPERTIES TIMEOUT 120)
 
+  # Standalone (no Catch2): exits non-zero on a failed check.
+  add_executable(test_pte_dual_kink test_pte_dual_kink.cpp)
+  target_link_libraries(test_pte_dual_kink PRIVATE singularity-eos::singularity-eos)
+  add_test(pte_dual_kink test_pte_dual_kink)
+
   if(SINGULARITY_USE_SPINER)
     if(SINGULARITY_USE_KOKKOS AND Kokkos_ENABLE_HIP
       AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "19.0.0")
