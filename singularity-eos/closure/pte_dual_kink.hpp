@@ -47,7 +47,7 @@
 // matching frozen-quality c_v.  Frozen quality omits the latent-heat relaxation, so this is the
 // stiffer (upper) two-phase sound speed.  See DualKinkDiagnostics.
 //
-// Offline twin: pfc/sim/matdata/_pte_dual_kink.py.  Units are the caller's (FLASH passes cgs).
+// Units are the caller's (FLASH passes cgs).
 //------------------------------------------------------------------------------
 
 #ifndef _SINGULARITY_EOS_CLOSURE_PTE_DUAL_KINK_
