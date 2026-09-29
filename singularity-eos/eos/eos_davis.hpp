@@ -512,13 +512,15 @@ PORTABLE_INLINE_FUNCTION Real DavisReactants::Ps(const Real rho) const {
   const Real phat = 0.25 * _A2oB * _rho0;
   const Real b4y = 4.0 * _B * y;
 
+  // The reference isentrope passes through (rho0, P0): Es integrates this P_S, P0
+  // included.
   if (rho >= _rho0) {
-    return phat *
-           (b4y +
-            0.5 * (pow<2>(b4y) + onethird * (pow<3>(b4y) + _C * pow<4>(b4y) * 0.25)) +
-            robust::ratio(pow<2>(y), pow<4>(1 - y)));
+    return _P0 + phat * (b4y +
+                         0.5 * (pow<2>(b4y) +
+                                onethird * (pow<3>(b4y) + _C * pow<4>(b4y) * 0.25)) +
+                         robust::ratio(pow<2>(y), pow<4>(1 - y)));
   } else {
-    return phat * (std::exp(b4y) - 1.0);
+    return _P0 + phat * (std::exp(b4y) - 1.0);
   }
 }
 PORTABLE_INLINE_FUNCTION Real DavisReactants::Es(const Real rho) const {
@@ -541,6 +543,9 @@ PORTABLE_INLINE_FUNCTION Real DavisReactants::Es(const Real rho) const {
 PORTABLE_INLINE_FUNCTION Real DavisReactants::Ts(const Real rho) const {
   if (rho <= 0) return _T0;
   const Real rho0overrho = robust::ratio(_rho0, std::max(rho, 0.));
+  // Integrates d ln Ts / d ln rho = Gamma(rho) branch by branch, so it is piecewise like
+  // Gamma: Gamma = G0 below rho0, G0 + Z y above.
+  if (rho < _rho0) return _T0 * std::pow(rho0overrho, -_G0);
   const Real y = 1 - rho0overrho;
   return _T0 * std::exp(-_Z * y) * std::pow(rho0overrho, -_G0 - _Z);
 }
@@ -564,9 +569,9 @@ PORTABLE_INLINE_FUNCTION Real DavisReactants::BulkModulusFromDensityInternalEner
   // K_S = -v (dP/dv)_s with P = Ps + (Gamma/v)(e - Es) and de/dv = -P along the
   // isentrope:
   //   (dP/dv)_s = Ps' + rho (Gamma' - Gamma rho)(e - Es) - Gamma rho (Es' + P).
-  // Es' = dEs/dv = -(Ps + P0); d/dy [y^2/(1-y)^4] = 2y/(1-y)^4 + 4y^2/(1-y)^5; and
+  // Es' = dEs/dv = -Ps; d/dy [y^2/(1-y)^4] = 2y/(1-y)^4 + 4y^2/(1-y)^5; and
   // Gamma = G0 + Z (1 - rho0 v) on the compressed branch, so Gamma' = -Z rho0.
-  const Real esv = -(Ps(std::max(rho, 0.)) + _P0);
+  const Real esv = -Ps(std::max(rho, 0.));
   const Real psv =
       (rho >= _rho0)
           ? -phat * _rho0 *
@@ -632,7 +637,9 @@ PORTABLE_INLINE_FUNCTION void DavisReactants::RhoTPartials(const Real rho,
   const Real Es_rho = robust::ratio(_P0, rho * rho) + phat * _spvol0 * des_dy * dy_drho;
   // Thermal part: theta = e - Es = Cv0/(1+alpha) (T^(1+alpha) Ts^-alpha - Ts).
   const Real t_s = Ts(rho);
-  const Real Ts_rho = t_s * (-_Z * dy_drho + robust::ratio(_G0 + _Z, rho));
+  const Real Ts_rho = (rho >= _rho0)
+                          ? t_s * (-_Z * dy_drho + robust::ratio(_G0 + _Z, rho))
+                          : t_s * robust::ratio(_G0, rho);
   const Real ratio_a = std::pow(robust::ratio(temp, t_s), _alpha);
   const Real theta = _Cv0 * t_s * _i1pa * (ratio_a * robust::ratio(temp, t_s) - 1.0);
   const Real dtheta_dTs =

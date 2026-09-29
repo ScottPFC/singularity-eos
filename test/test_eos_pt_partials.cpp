@@ -145,11 +145,14 @@ SCENARIO("Exact (P,T) partials match differences and satisfy Maxwell", "[PTParti
       for (Real T : {1.0, 300.0, 3.0e4})
         CheckPartials(eos, P, T, lambda, 1.0e-8);
   }
-  GIVEN("Davis reactants, on both the compressed and the expanded branch") {
-    const auto eos = CompB();
-    for (Real P : {1.0e7, 1.0e9, 1.0e11})
-      for (Real T : {300.0, 1500.0})
-        CheckPartials(eos, P, T, lambda, 1.0e-7);
+  GIVEN(
+      "Davis reactants, on both branches, with a density-dependent Gruneisen and a P0") {
+    // Z != 0 and P0 != 0 are what the piecewise reference-isentrope temperature and the
+    // P0 in the isentrope pressure keep Maxwell-consistent on the expanded branch.
+    for (const auto &eos : {CompB(), CompB(0.3, 0.0), CompB(0.3, 1.0e9)})
+      for (Real P : {1.0e7, 1.0e9, 1.0e11})
+        for (Real T : {300.0, 1500.0})
+          CheckPartials(eos, P, T, lambda, 1.0e-7);
   }
   GIVEN("Davis products") {
     const auto eos = Products();
