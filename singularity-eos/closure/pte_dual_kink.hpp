@@ -30,6 +30,15 @@
 // predicted by Clapeyron.  The kink is detected by the inner bracket collapsing with both ends
 // outside tolerance, which is a measurement, not a flatness sensor.
 //
+// psi is defined only where the isochore has a volume root inside the pressure box.  From a far
+// seed it may have none at the seed temperature; the volume residual at the box ends then says
+// which way the domain lies (too expanded at every P: cool; too compressed: heat), and phase 2
+// steps T geometrically that way until the isochore exists.  A cell phase 2 still cannot close is
+// handed to PTESolveDual from the caller's untouched inputs, so the kink solver converges on
+// every cell the dual does.  The one exception is a certified decline: the isochore AT a
+// temperature bound, twice, with the energy residual pointing further out, which proves no
+// state in the box meets the target.
+//
 // THE MIXTURE MODULUS ON A KINK.  A group member's returned density is its lever density, inside
 // the two-phase gap, where a (rho,T) table's bulk modulus is ~0 on a flattened tie-line and
 // negative on a raw loop.  The solver therefore reports, per group member, Wood's frozen-quality
@@ -275,8 +284,9 @@ struct DualKinkDiagnostics {
 // then Newton on the reduced dual psi with the kink step.  Argument contract is PTESolveDual's.
 // On a converged kink, the two-phase group's per-material outputs are the lever states
 // (one quality for the whole group), so vfrac closes exactly.  Status fields:
-// `safeguard_iters` counts reduced (psi) iterations, 0 when Newton alone closed the cell, and
-// `pressure_jump_attempts` is 1 when the returned state is on a kink.
+// `safeguard_iters` counts reduced (psi) iterations, 0 when Newton alone closed the cell;
+// `pressure_jump_attempts` is 1 when the returned state is on a kink; and `stagnation_iters` is
+// 1 when phase 2 could not close the cell and the status is PTESolveDual's.
 template <typename EOSIndexer, typename RealIndexer, typename LambdaIndexer>
 PORTABLE_INLINE_FUNCTION SolverStatus
 PTESolveDualKink(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_tot,
@@ -533,6 +543,21 @@ PTESolveDualKink(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_tot,
     return false;
   };
 
+  // Which way the isochore's domain lies from Tq when it has no volume root in the box: -1 cool
+  // (the mixture is too expanded even at the top of the box), +1 heat (too compressed even at
+  // the bottom), 0 when the ends straddle tau0 or are not finite.
+  auto isochore_direction = [&](const Real Tq) {
+    Real tau_lo = 0, tau_hi = 0;
+    for (std::size_t m = 0; m < nmat; ++m) {
+      tau_lo += Ym[m] * tau_of(m, p_lo_bracket, Tq);
+      tau_hi += Ym[m] * tau_of(m, p_hi, Tq);
+    }
+    if (!std::isfinite(tau_lo) || !std::isfinite(tau_hi)) return 0;
+    if (tau_lo > tau0 && tau_hi > tau0) return -1;
+    if (tau_lo < tau0 && tau_hi < tau0) return 1;
+    return 0;
+  };
+
   // Follow a known kink to a new T by bisecting onto the GROUP's volume jump around the
   // Clapeyron prediction; the target is the group volume the mixture needs there.
   auto track_kink = [&](const Real Tq, const Isochore &prev, Isochore &out) {
@@ -581,6 +606,7 @@ PTESolveDualKink(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_tot,
   Real previous_f = std::numeric_limits<Real>::infinity();
   int pinned = 0;
   bool done = false;
+  bool certified_decline = false;
   std::size_t phase2_iters = 0;
   while (iters < max_iter) {
     ++iters;
@@ -588,7 +614,16 @@ PTESolveDualKink(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_tot,
     bool got = false;
     if (cur.valid && cur.kink) got = track_kink(T, cur, cand);
     if (!got) got = full_isochore(T, cur.valid ? cur.P : P, cand);
-    if (!got) break;
+    if (!got) {
+      const int dir = isochore_direction(T);
+      const Real lo_b = known_below ? t_below : t_lo_clamp;
+      const Real hi_b = known_above ? t_above : t_hi;
+      const Real t_next =
+          (dir > 0) ? std::min(T * kMaxTRatio, hi_b) : std::max(T / kMaxTRatio, lo_b);
+      if (dir == 0 || !(t_next != T)) break;
+      T = t_next;
+      continue;
+    }
     cur = cand;
     const Real f = cur.e - sie_tot;
     if (std::abs(f) < tol * e_scale && std::abs(cur.tau - tau0) < scale) {
@@ -607,7 +642,10 @@ PTESolveDualKink(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_tot,
     const bool at_floor = T <= t_lo_clamp * (1.0 + 1.0e-12) && f > 0.0;
     const bool at_ceil = T >= t_hi * (1.0 - 1.0e-12) && f < 0.0;
     pinned = (at_floor || at_ceil) ? pinned + 1 : 0;
-    if (pinned >= 2) break;
+    if (pinned >= 2) {
+      certified_decline = true;
+      break;
+    }
     // A bracket at machine width is the resolution floor the kink endpoints set.
     if (known_below && known_above && t_above <= t_below * (1.0 + 4.0e-16)) break;
     Real t_next = (cur.slope > 0.0 && std::isfinite(cur.slope))
@@ -628,15 +666,26 @@ PTESolveDualKink(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_tot,
 
   status.max_niter = iters;
   status.safeguard_iters = phase2_iters;
-  if (!cur.valid) return status;
-  status.pressure_jump_attempts = cur.kink ? 1 : 0;
-  status.residual = std::max(std::abs(cur.tau - tau0) / tau0, std::abs(cur.e - sie_tot) / e_scale);
-  if (!done) return status;
-  for (std::size_t m = 0; m < nmat; ++m) {
-    Real tau_m = cur.other[m].tau;
-    if (cur.kink && cur.in_group[m])
-      tau_m = (1.0 - cur.x) * cur.dense[m].tau + cur.x * cur.light[m].tau;
-    if (!(tau_m > 0.0)) return status;
+  if (cur.valid) {
+    status.pressure_jump_attempts = cur.kink ? 1 : 0;
+    status.residual =
+        std::max(std::abs(cur.tau - tau0) / tau0, std::abs(cur.e - sie_tot) / e_scale);
+  }
+  if (done) {
+    for (std::size_t m = 0; m < nmat; ++m) {
+      Real tau_m = cur.other[m].tau;
+      if (cur.kink && cur.in_group[m])
+        tau_m = (1.0 - cur.x) * cur.dense[m].tau + cur.x * cur.light[m].tau;
+      if (!(tau_m > 0.0)) done = false;
+    }
+  }
+  if (!done) {
+    if (certified_decline) return status;
+    // Nothing has been written back, so the dual starts from exactly the caller's inputs.
+    SolverStatus fallback = PTESolveDual(nmat, eos, vfrac_tot, sie_tot, rho, vfrac, sie, temp,
+                                         press, lambda, Tguess, params);
+    fallback.stagnation_iters = 1;
+    return fallback;
   }
   status.converged = true;
   for (std::size_t m = 0; m < nmat; ++m) {

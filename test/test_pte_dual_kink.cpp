@@ -6,7 +6,9 @@
 // is known exactly: the solver must return T*, the vdW member's lever quality x*, Wood's
 // frozen-quality modulus over the two saturated states, and the constant vdW c_v.  A second
 // block checks that on single-phase cells Newton alone closes, the kink solver's output is
-// bitwise PTESolveDual's.
+// bitwise PTESolveDual's.  A third, in a narrow pressure box, takes far temperature seeds whose
+// isochore has no volume root in the box: phase 2 must walk T to where it has one, and no cell
+// the dual closes may be lost.
 //
 // Standalone (no Catch2): prints one line per check, exits non-zero on any failure.
 //------------------------------------------------------------------------------
@@ -29,6 +31,8 @@ using Real = double;
 namespace {
 
 constexpr Real kGPa = 1.0e10, kMJkg = 1.0e10;
+// Pressure box every material reports; the far-seed block narrows it.
+Real g_p_min = 1.0, g_p_max = 10 * kGPa;
 
 struct Sat {
   Real T = -1, p = 0, tl = 0, tv = 0, el = 0, ev = 0;
@@ -208,8 +212,8 @@ struct AnyEos {
                                                        Real &a, Real &b, Real &c, Real &d) const {
     DD(P, T, r, s, a, b, c, d);
   }
-  Real MinimumPressure() const { return 1.0; }
-  Real MaximumPressureAtTemperature(Real) const { return 10 * kGPa; }
+  Real MinimumPressure() const { return g_p_min; }
+  Real MaximumPressureAtTemperature(Real) const { return g_p_max; }
   Real MinimumTemperature() const { return Tmin(); }
   Real PressureFromDensityTemperature(Real, Real) const { return 1.0e6; }
 };
@@ -374,6 +378,70 @@ int main() {
     }
   }
   check(parity_cells > 0, "parity: some cells closed by Newton alone", parity_cells, 1, 0);
+
+  // ---- far seeds in a narrow box: the seed isochore has no volume root ----
+  g_p_min = 1.0e5;
+  g_p_max = 1.0e10;
+  MixParams pf = Params(1.0e-8);
+  pf.temperature_limit = 1.0e7;
+  const AnyEos *pairs[3][2] = {{&w_ideal, &w_stiff}, {&w_vdw, &w_ideal}, {&w_vdw, &w_stiff}};
+  auto solve = [&](int arm, int pr, Real T0, Real P0, Real Y0, Real sf, Real ps, Real &T_out,
+                   Real &P_out) {
+    Real tau[2], e[2];
+    for (int m = 0; m < 2; ++m) {
+      Real r, se;
+      pairs[pr][m]->DE(P0, T0, r, se);
+      tau[m] = 1 / r;
+      e[m] = se;
+    }
+    const Real Y[2] = {Y0, 1 - Y0};
+    const Real tau0 = Y[0] * tau[0] + Y[1] * tau[1], e0 = Y[0] * e[0] + Y[1] * e[1];
+    Real rho[2] = {1 / tau0, 1 / tau0}, vf[2] = {Y[0], Y[1]}, sie[2] = {0, 0};
+    Real temp[2] = {0, 0}, press[2] = {P0 * ps, P0 * ps};
+    Real Tg = T0 * sf;
+    Idx eos{{pairs[pr][0], pairs[pr][1]}};
+    const SolverStatus st =
+        (arm == 0) ? PTESolveDual(2, eos, 1.0, e0, RawIdx{rho}, RawIdx{vf}, RawIdx{sie},
+                                  RawIdx{temp}, RawIdx{press}, NullLambda{}, Tg, pf)
+                   : PTESolveDualKink(2, eos, 1.0, e0, RawIdx{rho}, RawIdx{vf}, RawIdx{sie},
+                                      RawIdx{temp}, RawIdx{press}, NullLambda{}, Tg, pf);
+    T_out = Tg;
+    P_out = press[0];
+    return st;
+  };
+  // Hot supercritical cells seeded at 1% and 10% of T*: without the isochore walk phase 2
+  // stops on its first iteration.
+  for (int pr = 0; pr < 3; ++pr) {
+    for (Real Y0 : {0.1, 0.5, 0.9}) {
+      for (Real sf : {0.01, 0.1}) {
+        const Real T0 = 20000.0, P0 = 1.0e6;
+        Real T, P;
+        const SolverStatus st = solve(1, pr, T0, P0, Y0, sf, 1.0e4, T, P);
+        char label[96];
+        std::snprintf(label, sizeof(label), "far seed pair=%d Y=%.1f seed=%.2f closed by phase 2",
+                      pr, Y0, sf);
+        check(st.converged && st.stagnation_iters == 0 && st.safeguard_iters > 0, label,
+              st.converged, 1, 0);
+        check_rel("far seed: T == T*", T, T0, 1e-6);
+        check_rel("far seed: P == P*", P, P0, 1e-5);
+      }
+    }
+  }
+  // No cell the dual closes is lost, over a grid of far seeds and warm-start pressures.
+  long dual_ok = 0, lost = 0;
+  for (int pr = 0; pr < 3; ++pr)
+    for (Real T0 : {300.0, 600.0, 2000.0, 20000.0})
+      for (Real P0 : {1.0e6, 1.0e8, 3.0e9})
+        for (Real Y0 : {0.1, 0.5, 0.9})
+          for (Real sf : {1e-2, 0.1, 10.0, 100.0})
+            for (Real ps : {0.0, 1e-4, 1e4}) {
+              Real Td, Pd, Tk, Pk;
+              const bool d = solve(0, pr, T0, P0, Y0, sf, ps, Td, Pd).converged;
+              const bool k = solve(1, pr, T0, P0, Y0, sf, ps, Tk, Pk).converged;
+              dual_ok += d;
+              lost += (d && !k);
+            }
+  check(dual_ok > 0 && lost == 0, "far seeds: no cell the dual closes is lost", lost, 0, 0);
 
   std::printf("%d/%d checks passed\n", g_checks - g_failures, g_checks);
   return g_failures == 0 ? 0 : 1;
