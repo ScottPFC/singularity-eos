@@ -5,6 +5,9 @@
 // the Davis bulk moduli against a finite-difference isentropic derivative.
 //------------------------------------------------------------------------------
 
+// First, so this file fails to build if the header stops compiling on its own.
+#include <singularity-eos/eos/eos_davis.hpp>
+
 #include <cmath>
 #include <limits>
 
