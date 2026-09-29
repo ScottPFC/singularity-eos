@@ -17,6 +17,7 @@
 #include <cmath>
 #include <limits>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #ifndef CATCH_CONFIG_FAST_COMPILE
@@ -523,4 +524,55 @@ SCENARIO("Density- and Pressure-Temperature PTE Solvers", "[PTE]") {
 }
 #endif // SINGULARITY_USE_SPINER_WITH_HDF5
 #endif // SINGULARITY_TEST_SESAME
+
+// Pointer indexers are held by value, so a Real[] or EOS[] handed straight to a solver's
+// constructor (which decays to a temporary pointer) does not leave the solver a dangling
+// reference.  Class-type indexers are still held by reference.
+static_assert(
+    std::is_same<singularity::mix_impl::IndexerMember<Real *>, Real *const>::value,
+    "pointer indexers must be held by value");
+static_assert(std::is_same<singularity::mix_impl::IndexerMember<std::vector<Real>>,
+                           const std::vector<Real> &>::value,
+              "class-type indexers must be held by reference");
+
+#ifndef PORTABILITY_STRATEGY_KOKKOS
+TEST_CASE("PTE solvers accept arrays passed directly", "[PTE]") {
+  // Two stiffened gases at one (P, T): the equilibrium is known in closed form.
+  constexpr int NMAT = 2;
+  constexpr Real gm1[NMAT] = {0.4, 3.0}, cv[NMAT] = {1.0e7, 2.0e7},
+                 pinf[NMAT] = {1.0e8, 1.0e10};
+  singularity::StiffGas eos[NMAT] = {singularity::StiffGas(gm1[0], cv[0], pinf[0], 0.0),
+                                     singularity::StiffGas(gm1[1], cv[1], pinf[1], 0.0)};
+  constexpr Real T_true = 500.0, P_true = 1.0e9;
+  Real rhobar[NMAT], sie_tot = 0.0;
+  Real rho_true[NMAT];
+  for (int m = 0; m < NMAT; ++m) {
+    rho_true[m] = (P_true + pinf[m]) / (gm1[m] * cv[m] * T_true);
+    rhobar[m] = 0.5 * rho_true[m];
+    sie_tot += rhobar[m] * cv[m] * T_true * (P_true + (gm1[m] + 1.0) * pinf[m]) /
+               (P_true + pinf[m]);
+  }
+  sie_tot /= rhobar[0] + rhobar[1];
+  // A deliberately wrong volume split, so the solver has to iterate.
+  Real rho[NMAT] = {rhobar[0] / 0.2, rhobar[1] / 0.8};
+  Real vfrac[NMAT] = {0.2, 0.8};
+  Real sie[NMAT] = {0.0, 0.0}, temp[NMAT] = {0.0, 0.0}, press[NMAT] = {0.0, 0.0};
+  singularity::NullIndexer lambda;
+  std::vector<Real> scratch(singularity::PTESolverRhoTRequiredScratch(NMAT));
+  Real *pscratch = scratch.data();
+  singularity::PTESolverRhoT<singularity::StiffGas *, Real *, singularity::NullIndexer>
+      method(NMAT, eos, 1.0, sie_tot, rho, vfrac, sie, temp, press, lambda, pscratch,
+             300.0, singularity::MixParams());
+  const auto status = singularity::PTESolver(method);
+  REQUIRE(status.converged);
+  // To the solver's default tolerances (~1e-6), not round-off.
+  for (int m = 0; m < NMAT; ++m) {
+    INFO("m = " << m << " T " << temp[m] << " P " << press[m] << " (" << P_true
+                << ") rho " << rho[m] << " (" << rho_true[m] << ") vfrac " << vfrac[m]);
+    CHECK(isClose(temp[m], T_true, 1.0e-5));
+    CHECK(isClose(press[m], P_true, 1.0e-5));
+    CHECK(isClose(rho[m], rho_true[m], 1.0e-5));
+  }
+}
+#endif // PORTABILITY_STRATEGY_KOKKOS
 #endif // SINGULARITY_BUILD_CLOSURE

@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <type_traits>
 #include <utility>
 
 #ifdef SINGULARITY_USE_KOKKOSKERNELS
@@ -330,6 +331,17 @@ class CacheAccessor {
  private:
   Real *cache_;
 };
+
+// How PTESolverBase holds an EOS or Real indexer.  A POINTER is held by value: an array
+// argument (`Real rho[N]`, `EOS eos[N]`) decays to a temporary pointer, which a reference
+// member would outlive, and copying a pointer copies no data, so writes through it still reach
+// the caller's arrays.  A class-type indexer stays a reference, because it may own its data
+// (a copy would take the solver's writes) and may not be copyable at all; it must outlive the
+// solver.
+template <typename Indexer>
+using IndexerMember =
+    typename std::conditional<std::is_pointer<Indexer>::value, const Indexer,
+                              const Indexer &>::type;
 
 // ======================================================================
 // Base class
@@ -1353,12 +1365,13 @@ class PTESolverBase {
   const std::size_t nmat, neq;
   std::size_t niter;
   const Real vfrac_total, sie_total;
-  const EOSIndexer &eos;
-  const RealIndexer &rho;
-  const RealIndexer &vfrac;
-  const RealIndexer &sie;
-  const RealIndexer &temp;
-  const RealIndexer &press;
+  IndexerMember<EOSIndexer> eos;
+  IndexerMember<RealIndexer> rho;
+  IndexerMember<RealIndexer> vfrac;
+  IndexerMember<RealIndexer> sie;
+  IndexerMember<RealIndexer> temp;
+  IndexerMember<RealIndexer> press;
+  // A non-const reference cannot bind a temporary, so this one cannot dangle.
   LambdaIndexer &lambda;
   Real *jacobian, *dx, *sol_scratch, *residual, *u, *rhobar;
   CacheAccessor Cache;
