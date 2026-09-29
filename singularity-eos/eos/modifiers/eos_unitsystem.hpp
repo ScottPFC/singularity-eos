@@ -213,6 +213,24 @@ class UnitSystem : public EosBase<UnitSystem<T>> {
     rho *= inv_rho_unit_;
     sie *= inv_sie_unit_;
   }
+  // Exact (P,T) partials by the chain rule through the unit conversion, instead of the
+  // EosBase central-difference default.
+  template <typename Indexer_t = Real *>
+  PORTABLE_FUNCTION void DensityEnergyDerivativesFromPressureTemperature(
+      const Real press, const Real temp, Indexer_t &&lambda, Real &rho, Real &sie,
+      Real &drho_dP, Real &drho_dT, Real &de_dP, Real &de_dT) const {
+    rho *= rho_unit_; // in case these are used for initial guesses
+    sie *= sie_unit_;
+    t_.DensityEnergyDerivativesFromPressureTemperature(
+        press * press_unit_, temp * temp_unit_, lambda, rho, sie, drho_dP, drho_dT, de_dP,
+        de_dT);
+    rho *= inv_rho_unit_;
+    sie *= inv_sie_unit_;
+    drho_dP *= inv_rho_unit_ * press_unit_;
+    drho_dT *= inv_rho_unit_ * temp_unit_;
+    de_dP *= inv_sie_unit_ * press_unit_;
+    de_dT *= inv_sie_unit_ * temp_unit_;
+  }
 
   template <typename Indexer_t = Real *>
   PORTABLE_FUNCTION void FillEos(Real &rho, Real &temp, Real &energy, Real &press,

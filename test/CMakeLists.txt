@@ -25,6 +25,7 @@ add_executable(
   test_eos_vinet.cpp
   test_eos_mgusup.cpp
   test_eos_powermg.cpp
+  test_eos_pt_partials.cpp
   $<$<BOOL:${SINGULARITY_BUILD_CLOSURE}>:test_pte_ideal.cpp>
   test_eos_zsplit.cpp
   )

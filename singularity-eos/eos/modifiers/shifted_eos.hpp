@@ -346,6 +346,16 @@ class ShiftedEOS : public EosBase<ShiftedEOS<T>> {
     t_.DensityEnergyFromPressureTemperature(press, temp, lambda, rho, sie);
     sie = sie + shift_;
   }
+  // A constant energy shift leaves every (P,T) partial unchanged; forward instead of
+  // falling to the EosBase central-difference default.
+  template <typename Indexer_t = Real *>
+  PORTABLE_FUNCTION void DensityEnergyDerivativesFromPressureTemperature(
+      const Real press, const Real temp, Indexer_t &&lambda, Real &rho, Real &sie,
+      Real &drho_dP, Real &drho_dT, Real &de_dP, Real &de_dT) const {
+    t_.DensityEnergyDerivativesFromPressureTemperature(press, temp, lambda, rho, sie,
+                                                       drho_dP, drho_dT, de_dP, de_dT);
+    sie = sie + shift_;
+  }
 
   template <typename Indexer_t = Real *>
   PORTABLE_FUNCTION void ValuesAtReferenceState(Real &rho, Real &temp, Real &sie,

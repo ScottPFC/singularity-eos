@@ -375,6 +375,21 @@ class ScaledEOS : public EosBase<ScaledEOS<T>> {
     rho = rho * inv_scale_;
     sie = sie * scale_;
   }
+  // Exact (P,T) partials by the chain rule (rho / scale, scale * e at fixed (P,T)), instead of
+  // the EosBase central-difference default.
+  template <typename Indexer_t = Real *>
+  PORTABLE_FUNCTION void DensityEnergyDerivativesFromPressureTemperature(
+      const Real press, const Real temp, Indexer_t &&lambda, Real &rho, Real &sie,
+      Real &drho_dP, Real &drho_dT, Real &de_dP, Real &de_dT) const {
+    t_.DensityEnergyDerivativesFromPressureTemperature(press, temp, lambda, rho, sie, drho_dP,
+                                                       drho_dT, de_dP, de_dT);
+    rho *= inv_scale_;
+    drho_dP *= inv_scale_;
+    drho_dT *= inv_scale_;
+    sie *= scale_;
+    de_dP *= scale_;
+    de_dT *= scale_;
+  }
 
   PORTABLE_FORCEINLINE_FUNCTION Real MinimumDensity() const {
     return inv_scale_ * t_.MinimumDensity();

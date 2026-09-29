@@ -238,6 +238,25 @@ class SubMixtureEOS : public EosBase<SubMixtureEOS<T>> {
     rho = robust::ratio(rho, s);
     sie *= s;
   }
+  // Exact (P,T) partials by the chain rule through the group's scaling: at fixed (P,T) the group
+  // is the base with rho / S_eff and S_eff * e, so every partial carries the same factor.  Without
+  // this override the call falls to the EosBase central difference, whose asymmetric Hessian the
+  // dual PTE solver cannot descend on (the grouped D+T fuel on V44).
+  template <typename Indexer_t = Real *>
+  PORTABLE_FUNCTION void DensityEnergyDerivativesFromPressureTemperature(
+      const Real press, const Real temp, Indexer_t &&lambda, Real &rho, Real &sie,
+      Real &drho_dP, Real &drho_dT, Real &de_dP, Real &de_dT) const {
+    const Real s = Scale(lambda);
+    t_.DensityEnergyDerivativesFromPressureTemperature(press, temp, lambda, rho, sie, drho_dP,
+                                                       drho_dT, de_dP, de_dT);
+    const Real inv_s = robust::ratio(1.0, s);
+    rho *= inv_s;
+    drho_dP *= inv_s;
+    drho_dT *= inv_s;
+    sie *= s;
+    de_dP *= s;
+    de_dT *= s;
+  }
 
   // Density bounds take NO lambda, so they cannot know the cell's S_eff -- but they do not need
   // to. S_eff = sum_m Y_m s_m is a weighted MEAN of the member scales, so for ANY composition it
