@@ -1250,6 +1250,21 @@ class PTESolverBase {
       u[m] = sie[m] * robust::ratio(rhobar[m], uscale);
   }
 
+  // Replace every material's pressure with its EOS pressure at the current (rho, T).  InitBase
+  // keeps a caller's pressure as the GUESS for an EOS whose preferred inputs include pressure,
+  // which is right for the (P,T) solvers, whose pressure is an unknown.  The (rho,T) and (rho,u)
+  // solvers instead derive pressure from density and compare the materials' pressures directly,
+  // so an unevaluated guess -- the same seed for every material, or zero -- reads as pressure
+  // equilibrium and the solve returns "converged" at iteration 0 with the densities untouched.
+  PORTABLE_INLINE_FUNCTION
+  void SetPressuresFromState() {
+    for (std::size_t m = 0; m < nmat; ++m) {
+      press[m] = robust::ratio(this->GetPressureFromPreferred(eos[m], rho[m], Tnorm * temp[m],
+                                                              sie[m], lambda[m], false),
+                               uscale);
+    }
+  }
+
   PORTABLE_INLINE_FUNCTION
   Real ResidualNorm() const {
     return 0.5 * sum_neumaier(residual, neq, 0, -1, [](const Real x) { return x * x; });
@@ -1507,6 +1522,7 @@ class PTESolverRhoT
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::utotal_scale;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::MatIndex;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::TryIdealPTE;
+  using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::SetPressuresFromState;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::jacobian;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::residual;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::dx;
@@ -1547,6 +1563,7 @@ class PTESolverRhoT
   PORTABLE_INLINE_FUNCTION
   Real Init() {
     InitBase();
+    SetPressuresFromState();
 
     // Decide which material's volume fraction should be set by the
     // sum of the others. If an index is passed in through mix params,
@@ -3084,6 +3101,7 @@ class PTESolverRhoU
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::uscale;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::utotal_scale;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::TryIdealPTE;
+  using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::SetPressuresFromState;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::MatIndex;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::jacobian;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::residual;
@@ -3127,6 +3145,7 @@ class PTESolverRhoU
   PORTABLE_INLINE_FUNCTION
   Real Init() {
     InitBase();
+    SetPressuresFromState();
     Residual();
     TryIdealPTE(this);
     return ResidualNorm();

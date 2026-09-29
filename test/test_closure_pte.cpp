@@ -574,5 +574,61 @@ TEST_CASE("PTE solvers accept arrays passed directly", "[PTE]") {
     CHECK(isClose(rho[m], rho_true[m], 1.0e-5));
   }
 }
+
+// The (rho,T) and (rho,u) solvers derive each material's pressure from its density and
+// compare them.  IdealGas lists pressure among its preferred inputs, so InitBase keeps
+// the caller's press[] as a guess; left unevaluated, a zero or common seed read as
+// pressure equilibrium and the solve returned "converged" at iteration 0 with the
+// densities untouched. PTESolverFixedT evaluates its pressures itself and is the control.
+TEST_CASE("PTE solvers evaluate pressures a caller seeds", "[PTE]") {
+  constexpr int NMAT = 2;
+  constexpr Real gm1[NMAT] = {0.4, 0.6}, cv[NMAT] = {1.0e7, 2.0e7};
+  constexpr Real T_true = 500.0, P_true = 1.0e9;
+  Real rho_true[NMAT], rhobar[NMAT], sie_tot = 0.0;
+  for (int m = 0; m < NMAT; ++m) {
+    rho_true[m] = P_true / (gm1[m] * cv[m] * T_true);
+    rhobar[m] = 0.5 * rho_true[m];
+    sie_tot += rhobar[m] * cv[m] * T_true;
+  }
+  sie_tot /= rhobar[0] + rhobar[1];
+  for (const Real seed : {0.0, 3.0e8}) {
+    for (const int solver : {0, 1, 2}) {
+      singularity::IdealGas eos[NMAT] = {singularity::IdealGas(gm1[0], cv[0]),
+                                         singularity::IdealGas(gm1[1], cv[1])};
+      Real rho[NMAT] = {rhobar[0] / 0.2, rhobar[1] / 0.8}, vfrac[NMAT] = {0.2, 0.8};
+      Real sie[NMAT] = {0.0, 0.0}, temp[NMAT] = {T_true, T_true},
+           press[NMAT] = {seed, seed};
+      singularity::NullIndexer lambda;
+      std::vector<Real> scratch(4096);
+      Real *pscratch = scratch.data();
+      singularity::IdealGas *peos = eos;
+      singularity::SolverStatus status;
+      using Ideal = singularity::IdealGas *;
+      if (solver == 0) {
+        singularity::PTESolverRhoT<Ideal, Real *, singularity::NullIndexer> s(
+            NMAT, peos, 1.0, sie_tot, rho, vfrac, sie, temp, press, lambda, pscratch,
+            300.0, singularity::MixParams());
+        status = singularity::PTESolver(s);
+      } else if (solver == 1) {
+        singularity::PTESolverRhoU<Ideal, Real *, singularity::NullIndexer> s(
+            NMAT, std::move(peos), 1.0, sie_tot, rho, vfrac, sie, temp, press, lambda,
+            pscratch, 300.0, singularity::MixParams());
+        status = singularity::PTESolver(s);
+      } else {
+        singularity::PTESolverFixedT<Ideal, Real *, singularity::NullIndexer> s(
+            NMAT, peos, 1.0, T_true, rho, vfrac, sie, temp, press, lambda, pscratch,
+            singularity::MixParams());
+        status = singularity::PTESolver(s);
+      }
+      INFO("solver " << solver << " seed " << seed << " rho " << rho[0] << ", " << rho[1]
+                     << " P " << press[0] << ", " << press[1]);
+      REQUIRE(status.converged);
+      for (int m = 0; m < NMAT; ++m) {
+        CHECK(isClose(rho[m], rho_true[m], 1.0e-5));
+        CHECK(isClose(press[m], P_true, 1.0e-5));
+      }
+    }
+  }
+}
 #endif // PORTABILITY_STRATEGY_KOKKOS
 #endif // SINGULARITY_BUILD_CLOSURE
