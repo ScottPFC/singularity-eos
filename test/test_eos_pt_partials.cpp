@@ -1,7 +1,8 @@
 //------------------------------------------------------------------------------
 // Exact (P,T) partials: DensityEnergyDerivativesFromPressureTemperature against
 // Richardson central differences of DensityEnergyFromPressureTemperature, the Maxwell
-// relation they must satisfy, and the (P,T) -> rho inversions they are built on.
+// relation they must satisfy, and the (P,T) -> rho inversions they are built on.  Also
+// the Davis bulk moduli against a finite-difference isentropic derivative.
 //------------------------------------------------------------------------------
 
 #include <cmath>
@@ -212,5 +213,41 @@ SCENARIO("Davis (P,T) inversions round-trip to round-off", "[PTPartials][Davis]"
         CHECK(std::abs(Pr - P) <= 1.0e-13 * P + 4.0 * kEps * rho * std::abs(P_rho));
       }
     }
+  }
+}
+
+// K_S = rho (dP/drho)_s, and along an isentrope de = (P/rho^2) drho, so
+//   K_S = rho (dP/drho)_e + (P/rho) (dP/de)_rho.
+template <typename E>
+void CheckBulkModulus(const E &eos, const Real rho, const Real sie) {
+  singularity::NullIndexer lambda;
+  auto P_rho = [&](Real r) {
+    return eos.PressureFromDensityInternalEnergy(r, sie, lambda);
+  };
+  auto P_sie = [&](Real e) {
+    return eos.PressureFromDensityInternalEnergy(rho, e, lambda);
+  };
+  const Real P = eos.PressureFromDensityInternalEnergy(rho, sie, lambda);
+  const Real ks_fd =
+      rho * Richardson(P_rho, rho, 1.0e-4) + (P / rho) * Richardson(P_sie, sie, 1.0e-4);
+  const Real ks = eos.BulkModulusFromDensityInternalEnergy(rho, sie, lambda);
+  INFO("rho = " << rho << " sie = " << sie << " P = " << P << " K_S = " << ks
+                << " FD = " << ks_fd);
+  CHECK(std::abs(ks - ks_fd) <= 1.0e-8 * std::abs(ks_fd));
+}
+
+SCENARIO("Davis bulk moduli are the isentropic derivative", "[Davis][BulkModulus]") {
+  GIVEN("Davis reactants on both branches, with a density-dependent Gruneisen and a P0") {
+    // rho0 = 1.71 itself is skipped: the difference would straddle the branch kink.
+    for (const auto &eos : {CompB(), CompB(0.3, 0.0), CompB(0.3, 1.0e9)})
+      for (Real rho : {1.2, 1.5, 2.0, 2.6})
+        for (Real sie : {1.0e9, 5.0e9})
+          CheckBulkModulus(eos, rho, sie);
+  }
+  GIVEN("Davis products, expanded and compressed") {
+    const auto eos = Products();
+    for (Real rho : {0.1, 0.5, 1.0, 2.0, 3.0})
+      for (Real sie : {1.0e9, 1.0e10})
+        CheckBulkModulus(eos, rho, sie);
   }
 }

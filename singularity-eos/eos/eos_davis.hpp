@@ -560,19 +560,25 @@ PORTABLE_INLINE_FUNCTION Real DavisReactants::BulkModulusFromDensityInternalEner
   const Real phat = 0.25 * _A2oB * _rho0;
   const Real b4y = 4 * _B * y;
   const Real gamma = Gamma(std::max(rho, 0.));
-  const Real esv = -Ps(std::max(rho, 0.));
+  // K_S = -v (dP/dv)_s with P = Ps + (Gamma/v)(e - Es) and de/dv = -P along the
+  // isentrope:
+  //   (dP/dv)_s = Ps' + rho (Gamma' - Gamma rho)(e - Es) - Gamma rho (Es' + P).
+  // Es' = dEs/dv = -(Ps + P0); d/dy [y^2/(1-y)^4] = 2y/(1-y)^4 + 4y^2/(1-y)^5; and
+  // Gamma = G0 + Z (1 - rho0 v) on the compressed branch, so Gamma' = -Z rho0.
+  const Real esv = -(Ps(std::max(rho, 0.)) + _P0);
   const Real psv =
       (rho >= _rho0)
           ? -phat * _rho0 *
                 (4 * _B * (1 + b4y + 0.5 * (pow<2>(b4y) + onethird * _C * pow<3>(b4y))) +
-                 3 * robust::ratio(y, pow<4>(1 - y)) +
+                 2 * robust::ratio(y, pow<4>(1 - y)) +
                  4 * robust::ratio(pow<2>(y), pow<5>(1 - y)))
           : -phat * 4 * _B * _rho0 * std::exp(b4y);
-  const Real gammav = (rho >= _rho0) ? _Z * _rho0 : 0.0;
-  const Real numerator =
-      -(psv + (sie - Es(rho)) * std::max(rho, 0.) * (gammav - gamma * std::max(rho, 0.)) -
-        gamma * std::max(rho, 0.) * esv);
-  return robust::ratio(numerator, std::max(rho, 0.));
+  const Real gammav = (rho >= _rho0) ? -_Z * _rho0 : 0.0;
+  const Real rho_c = std::max(rho, 0.);
+  const Real press = Ps(rho_c) + gamma * rho_c * (sie - Es(rho));
+  const Real numerator = -(psv + (sie - Es(rho)) * rho_c * (gammav - gamma * rho_c) -
+                           gamma * rho_c * (esv + press));
+  return robust::ratio(numerator, rho_c);
 }
 
 template <typename Indexer_t>
@@ -681,9 +687,13 @@ PORTABLE_INLINE_FUNCTION Real DavisProducts::BulkModulusFromDensityInternalEnerg
   if (rho <= 0) {
     return 0.;
   }
+  // K_S = -v (dP/dv)_s with P = Ps + rho Gamma (e - Es) and de/dv = -P along the
+  // isentrope, all as functions of x = v / vc (dx/dv = 1/vc):
+  //   (dP/dv)_s = Ps' + rho (Gamma' - Gamma rho)(e - Es) - Gamma rho (Es' + P).
   const Real vvc = robust::ratio(1.0, rho * _vc);
+  // dF/dx for F = 2a / (x^2n + 1).
   const Real Fx =
-      -4 * _a *
+      -4 * _a * _n *
       robust::ratio(std::pow(vvc, 2 * _n - 1), pow<2>(1 + std::pow(vvc, 2 * _n)));
   const Real tmp =
       robust::ratio(std::pow(0.5 * (std::pow(vvc, _n) + std::pow(vvc, -_n)), _aon),
@@ -699,9 +709,11 @@ PORTABLE_INLINE_FUNCTION Real DavisProducts::BulkModulusFromDensityInternalEnerg
   // const Real esv = _pc*_vc/(_k-1+_a)*(tmp+vvc*tmp_x)/_vc;
   const Real esv = robust::ratio(_pc, _k - 1 + _a) * (tmp + vvc * tmp_x);
   const Real gamma = Gamma(rho);
-  const Real gammav = (1 - _b) * Fx * _vc;
-  return -robust::ratio(
-      psv + (sie - Es(rho)) * rho * (gammav - gamma * rho) - gamma * rho * esv, rho);
+  const Real gammav = robust::ratio((1 - _b) * Fx, _vc);
+  const Real press = Ps(rho) + rho * gamma * (sie - Es(rho));
+  return -robust::ratio(psv + (sie - Es(rho)) * rho * (gammav - gamma * rho) -
+                            gamma * rho * (esv + press),
+                        rho);
 }
 template <typename Indexer_t>
 PORTABLE_INLINE_FUNCTION void DavisProducts::DensityEnergyFromPressureTemperature(
