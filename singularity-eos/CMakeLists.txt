@@ -82,6 +82,7 @@ if (SINGULARITY_BUILD_CLOSURE)
     closure/mixed_cell_models.hpp
     closure/pte_cyclic_rhoe.hpp
     closure/pte_dual.hpp
+    closure/pte_dual_kink.hpp
     closure/kinetic_phasetransition_models.hpp
     closure/kinetic_phasetransition_utils.hpp
     closure/kinetic_phasetransition_methods.hpp
