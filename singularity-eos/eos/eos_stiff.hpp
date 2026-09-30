@@ -183,6 +183,20 @@ class StiffGas : public EosBase<StiffGas> {
         robust::ratio(press + (_gm1 + 1.0) * _Pinf, press + _Pinf) * _Cv * temp + _qq);
     rho = std::max(robust::SMALL(), robust::ratio(press + _Pinf, _gm1 * _Cv * temp));
   }
+  // Exact (P,T) partials of rho = (P + Pinf) / (gm1 Cv T) and
+  // e = Cv T (P + gamma Pinf) / (P + Pinf) + q. Overrides the EosBase central-difference
+  // default so the PTE solvers see a Maxwell-consistent Hessian.
+  template <typename Indexer_t>
+  PORTABLE_INLINE_FUNCTION void DensityEnergyDerivativesFromPressureTemperature(
+      const Real press, const Real temp, Indexer_t &&lambda, Real &rho, Real &sie,
+      Real &drho_dP, Real &drho_dT, Real &de_dP, Real &de_dT) const {
+    DensityEnergyFromPressureTemperature(press, temp, lambda, rho, sie);
+    const Real pp = press + _Pinf;
+    drho_dP = robust::ratio(1.0, _gm1 * _Cv * temp);
+    drho_dT = -robust::ratio(rho, temp);
+    de_dP = -robust::ratio(_gm1 * _Cv * temp * _Pinf, pp * pp);
+    de_dT = _Cv * robust::ratio(press + (_gm1 + 1.0) * _Pinf, pp);
+  }
   inline void Finalize() {}
   static std::string EosType() { return std::string("StiffGas"); }
   static std::string EosPyType() { return EosType(); }

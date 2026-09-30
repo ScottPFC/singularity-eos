@@ -33,6 +33,15 @@ using namespace eos_base;
 // COMMENT: This is meant to be an implementation of the Steinberg version of
 // the Gruneisen EOS which should correspond to eostype(3) in xRAGE and
 // /[...]/eos/gruneisen in FLAG
+//
+// NOT THERMODYNAMICALLY CONSISTENT, BY DEFINITION.  The model (doc/sphinx/src/models.rst)
+// completes the Mie-Gruneisen P(rho, e) with T = T0 + e / Cv, an energy independent of
+// density at fixed T, so (de/drho)_T = 0 where Maxwell requires (P - T (dP/dT)_rho) / rho^2.
+// Its (P,T) partials therefore violate (de/dP)_T = -T (dtau/dT)_P - P (dtau/dP)_T: the
+// relative cross-term asymmetry PTESolveDual reports (SolverStatus::max_asymmetry) is ~0.4 on
+// this EOS, where a consistent one gives round-off.  The dual PTE solve assumes a symmetric
+// Hessian, so mixtures containing this EOS belong to the other PTE solvers; MGUsup is the
+// complete, consistent alternative for a Us-up Hugoniot.
 class Gruneisen : public EosBase<Gruneisen> {
  public:
   Gruneisen() = default;

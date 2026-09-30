@@ -17,9 +17,11 @@
 
 #include <cmath>
 #include <cstdio>
+#include <limits>
 
 #include <ports-of-call/portable_errors.hpp>
 #include <singularity-eos/base/constants.hpp>
+#include <singularity-eos/base/eos_error.hpp>
 #include <singularity-eos/base/math_utils.hpp>
 #include <singularity-eos/base/robust_utils.hpp>
 #include <singularity-eos/base/root-finding-1d/root_finding.hpp>
@@ -36,6 +38,72 @@
 namespace singularity {
 
 using namespace eos_base;
+
+namespace davis_impl {
+// Density at (P, T) for a (rho, T) EOS whose isotherm P(rho) is increasing (K_T > 0).
+// `p_of` fills P and (dP/drho)_T at a density. The root is bracketed by geometric
+// expansion from `guess`, so any positive density is reachable, then refined by Newton
+// steps safeguarded by bisection in log(rho), to machine precision. Returns false when no
+// sign change is found.
+template <typename PofRho>
+PORTABLE_INLINE_FUNCTION bool DensityFromPressureOnIsotherm(const PofRho &p_of,
+                                                            const Real press,
+                                                            const Real guess, Real &rho) {
+  constexpr Real kExpand = 10.0;
+  constexpr int kMaxExpand = 330;
+  constexpr int kMaxIter = 200;
+  Real P, dPdr;
+  Real lo = guess, hi = guess;
+  p_of(guess, P, dPdr);
+  if (!std::isfinite(P)) return false;
+  Real f_lo = P - press, f_hi = f_lo;
+  if (f_lo == 0.0) {
+    rho = guess;
+    return true;
+  }
+  int n = 0;
+  if (f_lo < 0.0) {
+    while (f_hi < 0.0 && n++ < kMaxExpand) {
+      lo = hi;
+      f_lo = f_hi;
+      hi *= kExpand;
+      p_of(hi, P, dPdr);
+      if (!std::isfinite(P)) return false;
+      f_hi = P - press;
+    }
+  } else {
+    while (f_lo > 0.0 && n++ < kMaxExpand) {
+      hi = lo;
+      f_hi = f_lo;
+      lo /= kExpand;
+      if (!(lo > 0.0)) return false;
+      p_of(lo, P, dPdr);
+      if (!std::isfinite(P)) return false;
+      f_lo = P - press;
+    }
+  }
+  if (!(f_lo <= 0.0 && f_hi >= 0.0)) return false;
+  Real x = std::sqrt(lo) * std::sqrt(hi);
+  for (int it = 0; it < kMaxIter; ++it) {
+    p_of(x, P, dPdr);
+    const Real f = P - press;
+    if (f == 0.0) break;
+    if (f < 0.0) {
+      lo = x;
+    } else {
+      hi = x;
+    }
+    Real x_new = (dPdr > 0.0) ? x - f / dPdr : -1.0;
+    if (!(x_new > lo && x_new < hi)) x_new = std::sqrt(lo) * std::sqrt(hi);
+    const bool done =
+        std::abs(x_new - x) <= 4.0 * std::numeric_limits<Real>::epsilon() * x;
+    x = x_new;
+    if (done || hi - lo <= 4.0 * std::numeric_limits<Real>::epsilon() * lo) break;
+  }
+  rho = x;
+  return true;
+}
+} // namespace davis_impl
 
 class DavisReactants : public EosBase<DavisReactants> {
  public:
@@ -174,6 +242,25 @@ class DavisReactants : public EosBase<DavisReactants> {
   PORTABLE_INLINE_FUNCTION void
   DensityEnergyFromPressureTemperature(const Real press, const Real temp,
                                        Indexer_t &&lambda, Real &rho, Real &sie) const;
+  // Exact (P,T) partials from the analytic (rho,T) partials (implicit-function theorem).
+  // Overrides the EosBase central-difference default, whose differenced root-find noise
+  // breaks the Maxwell relation (de/dP)_T = -T (dtau/dT)_P - P (dtau/dP)_T.
+  template <typename Indexer_t = Real *>
+  PORTABLE_INLINE_FUNCTION void DensityEnergyDerivativesFromPressureTemperature(
+      const Real press, const Real temp, Indexer_t &&lambda, Real &rho, Real &sie,
+      Real &drho_dP, Real &drho_dT, Real &de_dP, Real &de_dT) const {
+    DensityEnergyFromPressureTemperature(press, temp, lambda, rho, sie);
+    Real P, P_rho, P_T, e_rho, e_T;
+    RhoTPartials(rho, temp, P, P_rho, P_T, e_rho, e_T);
+    drho_dP = robust::ratio(1.0, P_rho);
+    drho_dT = -P_T * drho_dP;
+    de_dP = e_rho * drho_dP;
+    de_dT = e_T + e_rho * drho_dT;
+  }
+  // P(rho,T) with (dP/drho)_T, (dP/dT)_rho, (de/drho)_T and (de/dT)_rho, all analytic.
+  PORTABLE_INLINE_FUNCTION void RhoTPartials(const Real rho, const Real temp, Real &P,
+                                             Real &P_rho, Real &P_T, Real &e_rho,
+                                             Real &e_T) const;
   // Default accessors for mean atomic mass/number
   SG_ADD_DEFAULT_MEAN_ATOMIC_FUNCTIONS(_AZbar)
   // Generic functions provided by the base class. These contain e.g. the vector
@@ -310,6 +397,25 @@ class DavisProducts : public EosBase<DavisProducts> {
   PORTABLE_INLINE_FUNCTION void
   DensityEnergyFromPressureTemperature(const Real press, const Real temp,
                                        Indexer_t &&lambda, Real &rho, Real &sie) const;
+  // Exact (P,T) partials from the analytic (rho,T) partials (implicit-function theorem).
+  // Overrides the EosBase central-difference default, whose differenced root-find noise
+  // breaks the Maxwell relation (de/dP)_T = -T (dtau/dT)_P - P (dtau/dP)_T.
+  template <typename Indexer_t = Real *>
+  PORTABLE_INLINE_FUNCTION void DensityEnergyDerivativesFromPressureTemperature(
+      const Real press, const Real temp, Indexer_t &&lambda, Real &rho, Real &sie,
+      Real &drho_dP, Real &drho_dT, Real &de_dP, Real &de_dT) const {
+    DensityEnergyFromPressureTemperature(press, temp, lambda, rho, sie);
+    Real P, P_rho, P_T, e_rho, e_T;
+    RhoTPartials(rho, temp, P, P_rho, P_T, e_rho, e_T);
+    drho_dP = robust::ratio(1.0, P_rho);
+    drho_dT = -P_T * drho_dP;
+    de_dP = e_rho * drho_dP;
+    de_dT = e_T + e_rho * drho_dT;
+  }
+  // P(rho,T) with (dP/drho)_T, (dP/dT)_rho, (de/drho)_T and (de/dT)_rho, all analytic.
+  PORTABLE_INLINE_FUNCTION void RhoTPartials(const Real rho, const Real temp, Real &P,
+                                             Real &P_rho, Real &P_T, Real &e_rho,
+                                             Real &e_T) const;
   template <typename Indexer_t = Real *>
   PORTABLE_INLINE_FUNCTION void
   FillEos(Real &rho, Real &temp, Real &energy, Real &press, Real &cv, Real &bmod,
@@ -406,13 +512,15 @@ PORTABLE_INLINE_FUNCTION Real DavisReactants::Ps(const Real rho) const {
   const Real phat = 0.25 * _A2oB * _rho0;
   const Real b4y = 4.0 * _B * y;
 
+  // The reference isentrope passes through (rho0, P0): Es integrates this P_S, P0
+  // included.
   if (rho >= _rho0) {
-    return phat *
-           (b4y +
-            0.5 * (pow<2>(b4y) + onethird * (pow<3>(b4y) + _C * pow<4>(b4y) * 0.25)) +
-            robust::ratio(pow<2>(y), pow<4>(1 - y)));
+    return _P0 + phat * (b4y +
+                         0.5 * (pow<2>(b4y) +
+                                onethird * (pow<3>(b4y) + _C * pow<4>(b4y) * 0.25)) +
+                         robust::ratio(pow<2>(y), pow<4>(1 - y)));
   } else {
-    return phat * (std::exp(b4y) - 1.0);
+    return _P0 + phat * (std::exp(b4y) - 1.0);
   }
 }
 PORTABLE_INLINE_FUNCTION Real DavisReactants::Es(const Real rho) const {
@@ -435,6 +543,9 @@ PORTABLE_INLINE_FUNCTION Real DavisReactants::Es(const Real rho) const {
 PORTABLE_INLINE_FUNCTION Real DavisReactants::Ts(const Real rho) const {
   if (rho <= 0) return _T0;
   const Real rho0overrho = robust::ratio(_rho0, std::max(rho, 0.));
+  // Integrates d ln Ts / d ln rho = Gamma(rho) branch by branch, so it is piecewise like
+  // Gamma: Gamma = G0 below rho0, G0 + Z y above.
+  if (rho < _rho0) return _T0 * std::pow(rho0overrho, -_G0);
   const Real y = 1 - rho0overrho;
   return _T0 * std::exp(-_Z * y) * std::pow(rho0overrho, -_G0 - _Z);
 }
@@ -455,19 +566,25 @@ PORTABLE_INLINE_FUNCTION Real DavisReactants::BulkModulusFromDensityInternalEner
   const Real phat = 0.25 * _A2oB * _rho0;
   const Real b4y = 4 * _B * y;
   const Real gamma = Gamma(std::max(rho, 0.));
+  // K_S = -v (dP/dv)_s with P = Ps + (Gamma/v)(e - Es) and de/dv = -P along the
+  // isentrope:
+  //   (dP/dv)_s = Ps' + rho (Gamma' - Gamma rho)(e - Es) - Gamma rho (Es' + P).
+  // Es' = dEs/dv = -Ps; d/dy [y^2/(1-y)^4] = 2y/(1-y)^4 + 4y^2/(1-y)^5; and
+  // Gamma = G0 + Z (1 - rho0 v) on the compressed branch, so Gamma' = -Z rho0.
   const Real esv = -Ps(std::max(rho, 0.));
   const Real psv =
       (rho >= _rho0)
           ? -phat * _rho0 *
                 (4 * _B * (1 + b4y + 0.5 * (pow<2>(b4y) + onethird * _C * pow<3>(b4y))) +
-                 3 * robust::ratio(y, pow<4>(1 - y)) +
+                 2 * robust::ratio(y, pow<4>(1 - y)) +
                  4 * robust::ratio(pow<2>(y), pow<5>(1 - y)))
           : -phat * 4 * _B * _rho0 * std::exp(b4y);
-  const Real gammav = (rho >= _rho0) ? _Z * _rho0 : 0.0;
-  const Real numerator =
-      -(psv + (sie - Es(rho)) * std::max(rho, 0.) * (gammav - gamma * std::max(rho, 0.)) -
-        gamma * std::max(rho, 0.) * esv);
-  return robust::ratio(numerator, std::max(rho, 0.));
+  const Real gammav = (rho >= _rho0) ? -_Z * _rho0 : 0.0;
+  const Real rho_c = std::max(rho, 0.);
+  const Real press = Ps(rho_c) + gamma * rho_c * (sie - Es(rho));
+  const Real numerator = -(psv + (sie - Es(rho)) * rho_c * (gammav - gamma * rho_c) -
+                           gamma * rho_c * (esv + press));
+  return robust::ratio(numerator, rho_c);
 }
 
 template <typename Indexer_t>
@@ -476,20 +593,65 @@ PORTABLE_INLINE_FUNCTION void DavisReactants::DensityEnergyFromPressureTemperatu
   // First, solve P=P(rho,T) for rho.  Note P(rho,e) has an sie-es term, which is only a
   // function of T
   PORTABLE_REQUIRE(temp >= 0, "Negative temperature provided");
-  auto PofRatT = [&](const Real r) {
-    return (Ps(r) + Gamma(r) * r * _Cv0 * Ts(r) * _i1pa *
-                        (std::pow(robust::ratio(temp, Ts(r)), 1 + _alpha) - 1.0));
+  // Bracket from rho0 by expansion and finish with safeguarded Newton on the exact
+  // (dP/drho)_T, so the inversion is accurate to round-off over any positive density; a
+  // hot, dilute state lies far below 1e-5 g/cc. The exact (P,T) partials are derived from
+  // this root, so its noise would otherwise break their Maxwell relation.
+  auto p_of = [&](const Real r, Real &P, Real &P_rho) {
+    Real P_T, e_rho, e_T;
+    RhoTPartials(r, temp, P, P_rho, P_T, e_rho, e_T);
   };
-  using RootFinding1D::regula_falsi;
-  using RootFinding1D::Status;
-  auto status = regula_falsi(PofRatT, press, _rho0, 1.0e-5, 1.0e3, 1.0e-8, 1.0e-8, rho);
-  if (status != Status::SUCCESS) {
-    // Root finder failed even though the solution was bracketed... this is an error
+  if (!davis_impl::DensityFromPressureOnIsotherm(p_of, press, _rho0, rho)) {
     EOS_ERROR("DavisReactants::DensityEnergyFromPressureTemperature: "
               "Root find failed to find a solution given P, T\n");
   }
   rho = std::max(0., rho);
   sie = InternalEnergyFromDensityTemperature(rho, temp);
+}
+
+PORTABLE_INLINE_FUNCTION void DavisReactants::RhoTPartials(const Real rho,
+                                                           const Real temp, Real &P,
+                                                           Real &P_rho, Real &P_T,
+                                                           Real &e_rho, Real &e_T) const {
+  using namespace math_utils;
+  const Real y = 1.0 - robust::ratio(_rho0, rho);
+  const Real dy_drho = robust::ratio(_rho0, rho * rho);
+  const Real phat = 0.25 * _A2oB * _rho0;
+  const Real u = 4.0 * _B * y;
+  // Reference isentrope and its density derivatives, branch by branch as in Ps(), Es().
+  Real dPs_dy, des_dy;
+  if (rho >= _rho0) {
+    dPs_dy = phat * (4.0 * _B * (1.0 + u + 0.5 * u * u + _C * u * u * u / 6.0) +
+                     2.0 * y / pow<4>(1.0 - y) + 4.0 * y * y / pow<5>(1.0 - y));
+  } else {
+    dPs_dy = phat * 4.0 * _B * std::exp(u);
+  }
+  if (y > 0.0) {
+    const Real z = rho * _spvol0 - 1.0;
+    des_dy = 0.5 * (2.0 * u + u * u + u * u * u / 3.0 + _C * u * u * u * u / 12.0) +
+             z * z / pow<2>(1.0 - y);
+  } else {
+    des_dy = std::exp(u) - 1.0;
+  }
+  const Real Ps_rho = dPs_dy * dy_drho;
+  const Real Es_rho = robust::ratio(_P0, rho * rho) + phat * _spvol0 * des_dy * dy_drho;
+  // Thermal part: theta = e - Es = Cv0/(1+alpha) (T^(1+alpha) Ts^-alpha - Ts).
+  const Real t_s = Ts(rho);
+  const Real Ts_rho = (rho >= _rho0)
+                          ? t_s * (-_Z * dy_drho + robust::ratio(_G0 + _Z, rho))
+                          : t_s * robust::ratio(_G0, rho);
+  const Real ratio_a = std::pow(robust::ratio(temp, t_s), _alpha);
+  const Real theta = _Cv0 * t_s * _i1pa * (ratio_a * robust::ratio(temp, t_s) - 1.0);
+  const Real dtheta_dTs =
+      -_Cv0 * _i1pa * (_alpha * ratio_a * robust::ratio(temp, t_s) + 1.0);
+  const Real theta_rho = dtheta_dTs * Ts_rho;
+  const Real gamma = Gamma(rho);
+  const Real gamma_rho = (rho >= _rho0) ? _Z * dy_drho : 0.0;
+  e_T = _Cv0 * ratio_a;
+  e_rho = Es_rho + theta_rho;
+  P = Ps(rho) + gamma * rho * theta;
+  P_rho = Ps_rho + (gamma + rho * gamma_rho) * theta + gamma * rho * theta_rho;
+  P_T = gamma * rho * e_T;
 }
 
 template <typename Indexer_t>
@@ -533,9 +695,13 @@ PORTABLE_INLINE_FUNCTION Real DavisProducts::BulkModulusFromDensityInternalEnerg
   if (rho <= 0) {
     return 0.;
   }
+  // K_S = -v (dP/dv)_s with P = Ps + rho Gamma (e - Es) and de/dv = -P along the
+  // isentrope, all as functions of x = v / vc (dx/dv = 1/vc):
+  //   (dP/dv)_s = Ps' + rho (Gamma' - Gamma rho)(e - Es) - Gamma rho (Es' + P).
   const Real vvc = robust::ratio(1.0, rho * _vc);
+  // dF/dx for F = 2a / (x^2n + 1).
   const Real Fx =
-      -4 * _a *
+      -4 * _a * _n *
       robust::ratio(std::pow(vvc, 2 * _n - 1), pow<2>(1 + std::pow(vvc, 2 * _n)));
   const Real tmp =
       robust::ratio(std::pow(0.5 * (std::pow(vvc, _n) + std::pow(vvc, -_n)), _aon),
@@ -551,28 +717,59 @@ PORTABLE_INLINE_FUNCTION Real DavisProducts::BulkModulusFromDensityInternalEnerg
   // const Real esv = _pc*_vc/(_k-1+_a)*(tmp+vvc*tmp_x)/_vc;
   const Real esv = robust::ratio(_pc, _k - 1 + _a) * (tmp + vvc * tmp_x);
   const Real gamma = Gamma(rho);
-  const Real gammav = (1 - _b) * Fx * _vc;
-  return -robust::ratio(
-      psv + (sie - Es(rho)) * rho * (gammav - gamma * rho) - gamma * rho * esv, rho);
+  const Real gammav = robust::ratio((1 - _b) * Fx, _vc);
+  const Real press = Ps(rho) + rho * gamma * (sie - Es(rho));
+  return -robust::ratio(psv + (sie - Es(rho)) * rho * (gammav - gamma * rho) -
+                            gamma * rho * (esv + press),
+                        rho);
 }
 template <typename Indexer_t>
 PORTABLE_INLINE_FUNCTION void DavisProducts::DensityEnergyFromPressureTemperature(
     const Real press, const Real temp, Indexer_t &&lambda, Real &rho, Real &sie) const {
   PORTABLE_REQUIRE(temp >= 0, "Negative temperature provided");
-  auto PofRatT = [&](const Real r) {
-    return (Ps(r) + Gamma(r) * r * _Cv * (temp - Ts(r)));
-  };
-  using RootFinding1D::regula_falsi;
-  using RootFinding1D::Status;
   const Real rho0 = robust::ratio(1.0, _vc);
-  auto status = regula_falsi(PofRatT, press, rho0, 1.0e-5, 1.0e3, 1.0e-8, 1.0e-8, rho);
-  if (status != Status::SUCCESS) {
-    // Root finder failed even though the solution was bracketed... this is an error
+  // Expansion bracket + safeguarded Newton, for the same reasons as DavisReactants.
+  auto p_of = [&](const Real r, Real &P, Real &P_rho) {
+    Real P_T, e_rho, e_T;
+    RhoTPartials(r, temp, P, P_rho, P_T, e_rho, e_T);
+  };
+  if (!davis_impl::DensityFromPressureOnIsotherm(p_of, press, rho0, rho)) {
     EOS_ERROR("DavisProducts::DensityEnergyFromPressureTemperature: "
               "Root find failed to find a solution given P, T\n");
   }
   rho = std::max(rho, 0.);
   sie = InternalEnergyFromDensityTemperature(rho, temp);
+}
+
+PORTABLE_INLINE_FUNCTION void DavisProducts::RhoTPartials(const Real rho, const Real temp,
+                                                          Real &P, Real &P_rho, Real &P_T,
+                                                          Real &e_rho, Real &e_T) const {
+  // Everything is a function of x = v/vc = 1/(rho vc), with dx/drho = -x/rho.
+  const Real x = robust::ratio(1.0, rho * _vc);
+  const Real dx_drho = -robust::ratio(x, rho);
+  const Real xn = std::pow(x, _n);
+  const Real W = 0.5 * (xn + 1.0 / xn);
+  const Real dlnW_dx = 0.5 * _n * (xn - 1.0 / xn) / (x * W);
+  const Real x2n = xn * xn;
+  const Real F_rho = F(rho);
+  const Real dF_dx = -4.0 * _a * _n * x2n / (x * (x2n + 1.0) * (x2n + 1.0));
+  const Real Q = _pc * std::pow(W, _aon) * std::pow(x, -(_k + _a));
+  const Real ps = Q * (_k - 1.0 + F_rho) / (_k - 1.0 + _a);
+  const Real dPs_dx = ps * (_aon * dlnW_dx - (_k + _a) / x) + Q * dF_dx / (_k - 1.0 + _a);
+  const Real es = Es(rho);
+  const Real dEs_dx = es * (_aon * dlnW_dx - (_k - 1.0 + _a) / x);
+  const Real t_s = Ts(rho);
+  const Real dTs_dx =
+      t_s * (_aon * (1.0 - _b) * dlnW_dx - (_k - 1.0 + _a * (1.0 - _b)) / x);
+  const Real gamma = Gamma(rho);
+  const Real dGamma_dx = (1.0 - _b) * dF_dx;
+  const Real theta = _Cv * (temp - t_s);
+  e_T = _Cv;
+  e_rho = (dEs_dx - _Cv * dTs_dx) * dx_drho;
+  P = ps + rho * gamma * theta;
+  P_rho = dPs_dx * dx_drho + (gamma + rho * dGamma_dx * dx_drho) * theta -
+          rho * gamma * _Cv * dTs_dx * dx_drho;
+  P_T = rho * gamma * _Cv;
 }
 template <typename Indexer_t>
 PORTABLE_INLINE_FUNCTION void

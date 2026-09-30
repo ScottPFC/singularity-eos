@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <type_traits>
 #include <utility>
 
 #ifdef SINGULARITY_USE_KOKKOSKERNELS
@@ -78,6 +79,25 @@ struct MixParams {
   Real line_search_fac = 0.5;
   Real vfrac_safety_fac = 0.95;
   Real temperature_limit = 1.0e15;
+  // PTESolveDual switches.  The defaults are the fixed solver; setting all four to
+  // {false, false, 0, false} reproduces the pre-fix PTESolveDual bit for bit.
+  //
+  // When the recession heuristic fires, confirm it with the exact finite-box test -- one volume
+  // solve at the temperature bound the energy residual drives T to -- and decline only on that
+  // proof.  false restores the heuristic-only decline.
+  bool pte_dual_exact_certificate = true;
+  // The safeguard's fixed-P temperature sub-solve roots the ENTHALPY residual h = r_e + P r_tau
+  // (the exact maximiser of J on the fixed-P ray) and pairs it with the isenthalp tangent.  false
+  // keeps PTESolveCyclicRhoE's isoenergetic step and tangent.
+  bool pte_dual_enthalpy_tstep = true;
+  // With the enthalpy step: after two consecutive safeguard steps whose residual ratio exceeds
+  // this, fall back to the energy step for the rest of the solve.  0 disables the fallback.
+  Real pte_dual_enthalpy_slow_ratio = 0.7;
+  // The safeguard's three boundary corrections: an empty coordinate bracket steps to the box end
+  // the monotone residual points to, a tangent intersection that clamps back onto the current
+  // iterate is rejected, and the pressure bracket is floored at the EOS box minimum rather than
+  // at 1 barye.  false is the legacy safeguard, kept only to reproduce old results.
+  bool pte_dual_safeguard_fixes = true;
   Real default_tguess = 300.;
   Real min_dtde = 1.0e-16;
   std::size_t pte_small_step_tries = 2;
@@ -119,7 +139,23 @@ struct SolverStatus {
   // contract the residual (PTESolveDual only).  Zero means the solve ran at pure-Newton cost, so
   // this is the diagnostic that says whether a cell needed the safeguard at all.
   std::size_t safeguard_iters = 0;
+  // PTESolveDual only.  Largest relative asymmetry of the assembled Hessian's cross term over the
+  // solve, |Xi_bg(e) - Xi_bg(tau)| / sqrt|Xi_bb Xi_gg|: 0 for a thermodynamically consistent EOS,
+  // so it is a runtime check on the table's Maxwell consistency.
+  Real max_asymmetry = 0.0;
+  // PTESolveDual only.  What the admissibility test concluded, if it ran (DualAdmissibility).
+  int admissibility = 0;
   Real residual;
+};
+
+// Outcome of PTESolveDual's admissibility test.  The heuristic (T railed at a bound, or a
+// same-sign stalled energy residual) only NOMINATES a cell; the exact check decides it.
+enum DualAdmissibility : int {
+  kAdmissibilityNotTested = 0,
+  kAdmissibilityUnreachable = 1, // proven: g0(T_bound) is on the wrong side of e0 -> declined
+  kAdmissibilityReachable = 2,   // proven: a state exists, the heuristic was wrong -> continued
+  kAdmissibilityUndecided = 3,   // no volume root at T_bound inside the P box -> continued
+  kAdmissibilityHeuristic = 4,   // exact check disabled; declined on the heuristic alone
 };
 
 namespace mix_impl {
@@ -295,6 +331,17 @@ class CacheAccessor {
  private:
   Real *cache_;
 };
+
+// How PTESolverBase holds an EOS or Real indexer.  A POINTER is held by value: an array
+// argument (`Real rho[N]`, `EOS eos[N]`) decays to a temporary pointer, which a reference
+// member would outlive, and copying a pointer copies no data, so writes through it still reach
+// the caller's arrays.  A class-type indexer stays a reference, because it may own its data
+// (a copy would take the solver's writes) and may not be copyable at all; it must outlive the
+// solver.
+template <typename Indexer>
+using IndexerMember =
+    typename std::conditional<std::is_pointer<Indexer>::value, const Indexer,
+                              const Indexer &>::type;
 
 // ======================================================================
 // Base class
@@ -1203,6 +1250,21 @@ class PTESolverBase {
       u[m] = sie[m] * robust::ratio(rhobar[m], uscale);
   }
 
+  // Replace every material's pressure with its EOS pressure at the current (rho, T).  InitBase
+  // keeps a caller's pressure as the GUESS for an EOS whose preferred inputs include pressure,
+  // which is right for the (P,T) solvers, whose pressure is an unknown.  The (rho,T) and (rho,u)
+  // solvers instead derive pressure from density and compare the materials' pressures directly,
+  // so an unevaluated guess -- the same seed for every material, or zero -- reads as pressure
+  // equilibrium and the solve returns "converged" at iteration 0 with the densities untouched.
+  PORTABLE_INLINE_FUNCTION
+  void SetPressuresFromState() {
+    for (std::size_t m = 0; m < nmat; ++m) {
+      press[m] = robust::ratio(this->GetPressureFromPreferred(eos[m], rho[m], Tnorm * temp[m],
+                                                              sie[m], lambda[m], false),
+                               uscale);
+    }
+  }
+
   PORTABLE_INLINE_FUNCTION
   Real ResidualNorm() const {
     return 0.5 * sum_neumaier(residual, neq, 0, -1, [](const Real x) { return x * x; });
@@ -1318,12 +1380,13 @@ class PTESolverBase {
   const std::size_t nmat, neq;
   std::size_t niter;
   const Real vfrac_total, sie_total;
-  const EOSIndexer &eos;
-  const RealIndexer &rho;
-  const RealIndexer &vfrac;
-  const RealIndexer &sie;
-  const RealIndexer &temp;
-  const RealIndexer &press;
+  IndexerMember<EOSIndexer> eos;
+  IndexerMember<RealIndexer> rho;
+  IndexerMember<RealIndexer> vfrac;
+  IndexerMember<RealIndexer> sie;
+  IndexerMember<RealIndexer> temp;
+  IndexerMember<RealIndexer> press;
+  // A non-const reference cannot bind a temporary, so this one cannot dangle.
   LambdaIndexer &lambda;
   Real *jacobian, *dx, *sol_scratch, *residual, *u, *rhobar;
   CacheAccessor Cache;
@@ -1459,6 +1522,7 @@ class PTESolverRhoT
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::utotal_scale;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::MatIndex;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::TryIdealPTE;
+  using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::SetPressuresFromState;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::jacobian;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::residual;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::dx;
@@ -1499,6 +1563,7 @@ class PTESolverRhoT
   PORTABLE_INLINE_FUNCTION
   Real Init() {
     InitBase();
+    SetPressuresFromState();
 
     // Decide which material's volume fraction should be set by the
     // sum of the others. If an index is passed in through mix params,
@@ -3036,6 +3101,7 @@ class PTESolverRhoU
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::uscale;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::utotal_scale;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::TryIdealPTE;
+  using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::SetPressuresFromState;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::MatIndex;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::jacobian;
   using mix_impl::PTESolverBase<EOSIndexer, RealIndexer, LambdaIndexer>::residual;
@@ -3079,6 +3145,7 @@ class PTESolverRhoU
   PORTABLE_INLINE_FUNCTION
   Real Init() {
     InitBase();
+    SetPressuresFromState();
     Residual();
     TryIdealPTE(this);
     return ResidualNorm();

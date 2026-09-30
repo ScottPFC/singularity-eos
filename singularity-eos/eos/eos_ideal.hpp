@@ -186,6 +186,18 @@ class IdealGas : public EosBase<IdealGas> {
     sie = MYMAX(0.0, _Cv * temp);
     rho = MYMAX(0.0, press / (_gm1 * sie));
   }
+  // Exact (P,T) partials of rho = P / (gm1 Cv T), e = Cv T. Overrides the EosBase
+  // central-difference default so the PTE solvers see a Maxwell-consistent Hessian.
+  template <typename Indexer_t = Real *>
+  PORTABLE_INLINE_FUNCTION void DensityEnergyDerivativesFromPressureTemperature(
+      const Real press, const Real temp, Indexer_t &&lambda, Real &rho, Real &sie,
+      Real &drho_dP, Real &drho_dT, Real &de_dP, Real &de_dT) const {
+    DensityEnergyFromPressureTemperature(press, temp, lambda, rho, sie);
+    drho_dP = robust::ratio(1.0, _gm1 * _Cv * temp);
+    drho_dT = -robust::ratio(rho, temp);
+    de_dP = 0.0;
+    de_dT = _Cv;
+  }
   template <typename Indexer_t = Real *>
   PORTABLE_INLINE_FUNCTION void InternalEnergyFromDensityPressure(
       const Real rho, const Real P, Real &sie,
