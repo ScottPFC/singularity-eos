@@ -331,8 +331,16 @@ int main() {
   }
 
   // ---- bitwise parity with PTESolveDual where Newton alone closes the cell ----
-  const MixParams p6 = Params(1.0e-6);
+  // Once with the default (fixed) dual, once with every legacy switch set.
   int parity_cells = 0;
+  for (int legacy = 0; legacy < 2; ++legacy) {
+  MixParams p6 = Params(1.0e-6);
+  if (legacy) {
+    p6.pte_dual_exact_certificate = false;
+    p6.pte_dual_enthalpy_tstep = false;
+    p6.pte_dual_enthalpy_slow_ratio = 0.0;
+    p6.pte_dual_safeguard_fixes = false;
+  }
   for (Real T0 : {400.0, 900.0, 2500.0}) {
     for (Real P0 : {1.0e7, 1.0e8, 1.0e9}) {
       for (Real sf : {0.7, 1.0, 1.6}) {
@@ -371,13 +379,46 @@ int main() {
         for (int k = 0; k < 5; ++k)
           for (int m = 0; m < 2; ++m) same = same && out[0][k][m] == out[1][k][m];
         char label[96];
-        std::snprintf(label, sizeof(label), "parity T=%g P=%g seed=%.1f (iters %zu)", T0, P0, sf,
-                      st[0].max_niter);
+        std::snprintf(label, sizeof(label), "parity %s T=%g P=%g seed=%.1f (iters %zu)",
+                      legacy ? "legacy" : "default", T0, P0, sf, st[0].max_niter);
         check(same, label, Tg_out[1], Tg_out[0], 0);
       }
     }
   }
+  }
   check(parity_cells > 0, "parity: some cells closed by Newton alone", parity_cells, 1, 0);
+
+  // ---- equilibrium below 1 barye: the box floor, not a 1-barye floor, brackets the volume root ----
+  {
+    g_p_min = 1.0e-12;
+    g_p_max = 1.0e10;
+    const MixParams pb = Params(1.0e-8);
+    int n = 0;
+    for (Real P0 : {1.0e-3, 1.0e-1}) {
+      for (Real sf : {0.7, 1.6}) {
+        const Real T0 = 1000.0;
+        Real tau_a, e_a, tau_b, e_b, d1, d2, d3, d4;
+        ideal.PT(P0, T0, tau_a, e_a, d1, d2, d3, d4);
+        stiff.PT(P0, T0, tau_b, e_b, d1, d2, d3, d4);
+        const Real Y[2] = {0.3, 0.7};
+        const Real tau0 = Y[0] * tau_a + Y[1] * tau_b, e0 = Y[0] * e_a + Y[1] * e_b;
+        Real rho[2] = {1 / tau0, 1 / tau0}, vf[2] = {Y[0], Y[1]}, sie[2] = {0, 0};
+        Real temp[2] = {0, 0}, press[2] = {0, 0};
+        Real Tg = T0 * sf;
+        Idx eos{{&w_ideal, &w_stiff}};
+        const SolverStatus st =
+            PTESolveDualKink(2, eos, 1.0, e0, RawIdx{rho}, RawIdx{vf}, RawIdx{sie}, RawIdx{temp},
+                             RawIdx{press}, NullLambda{}, Tg, pb);
+        char label[96];
+        std::snprintf(label, sizeof(label), "sub-barye P*=%g seed=%.1f", P0, sf);
+        check(st.converged, label, st.converged, 1, 0);
+        check_rel("sub-barye: T == T*", Tg, T0, 1e-6);
+        check_rel("sub-barye: P == P*", press[0], P0, 1e-6);
+        ++n;
+      }
+    }
+    check(n == 4, "sub-barye cells run", n, 4, 0);
+  }
 
   // ---- far seeds in a narrow box: the seed isochore has no volume root ----
   g_p_min = 1.0e5;

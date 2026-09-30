@@ -119,6 +119,13 @@ constexpr int kMaxBacktracks = 30;
 // three conditions for the recession certificate below.
 constexpr Real kRecessionStall = 0.9;
 
+// Lower end of every pressure bracket the dual solvers open: the EOS box minimum, so an
+// equilibrium below 1 barye stays reachable.  The legacy safeguard (pte_dual_safeguard_fixes =
+// false) floors it at 1 barye.  Shared with PTESolveDualKink so both open the same bracket.
+PORTABLE_INLINE_FUNCTION Real PressureBracketFloor(const Real p_lo, const MixParams &params) {
+  return params.pte_dual_safeguard_fixes ? std::max(p_lo, 1.0e-300) : std::max(p_lo, 1.0);
+}
+
 // The mixture gradient and Hessian of Xi at one (P, T).
 struct DualState {
   Real residual_energy; // dJ/dbeta  = sum Y_m e_m   - e0
@@ -324,10 +331,8 @@ PTESolveDual(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_tot, con
   }
   const Real t_hi = params.temperature_limit;
   if (!(p_hi > 0.0) || !(t_hi > t_lo)) return status;
-  // The pressure bracket floor is the EOS box minimum, so an equilibrium below 1 barye stays
-  // reachable.  The legacy safeguard (pte_dual_safeguard_fixes = false) floors it at 1 barye.
   const bool safeguard_fixes = params.pte_dual_safeguard_fixes;
-  const Real p_lo_bracket = safeguard_fixes ? std::max(p_lo, 1.0e-300) : std::max(p_lo, 1.0);
+  const Real p_lo_bracket = PressureBracketFloor(p_lo, params);
   const Real t_lo_bracket = std::max(t_lo, 1.0e-8);
   // The Newton iterate is clamped to a strictly positive box: gamma = P/T is a conjugate
   // variable, not a coordinate that may pass through zero.

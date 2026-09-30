@@ -22,7 +22,10 @@
 //      finite where the unreduced det H is unbounded.
 //
 // PHASE 1 is PTESolveDual's own seed, warm-start probe and Newton iteration, operation for
-// operation, so a cell the dual closes by Newton alone gets the dual's answer bit for bit.  The
+// operation, so a cell the dual closes by Newton alone gets the dual's answer bit for bit, for
+// the default MixParams and for the legacy switches alike.  The pressure bracket floor is the
+// dual's own (pte_dual_impl::PressureBracketFloor) and phase 2 brackets with it too.  Phase 1 has
+// no decline point: the dual's recession test needs a safeguard step, which phase 1 never takes.  The
 // first Newton step that fails to contract hands over, where PTESolveDual would take a coordinate
 // step, to PHASE 2: Newton on psi, safeguarded by a bracket on the monotone psi' (bisection
 // whenever a step fails to halve |psi'|, because psi' is only C0 in slope where the isochore
@@ -72,6 +75,7 @@ using cyclic_rhoe_impl::LogBracketRootCore;
 using pte_dual_impl::DualState;
 using pte_dual_impl::MixtureDual;
 using pte_dual_impl::NewtonDirection;
+using pte_dual_impl::PressureBracketFloor;
 
 constexpr std::size_t kMaxMat = 16;
 // Bracket width ratio at which an inner solve stops.  Tight, because on the kink the endpoint
@@ -286,7 +290,8 @@ struct DualKinkDiagnostics {
 // (one quality for the whole group), so vfrac closes exactly.  Status fields:
 // `safeguard_iters` counts reduced (psi) iterations, 0 when Newton alone closed the cell;
 // `pressure_jump_attempts` is 1 when the returned state is on a kink; and `stagnation_iters` is
-// 1 when phase 2 could not close the cell and the status is PTESolveDual's.
+// 1 when phase 2 could not close the cell and the status is PTESolveDual's.  A certified decline
+// reports admissibility = kAdmissibilityUnreachable, as the dual's exact certificate does.
 template <typename EOSIndexer, typename RealIndexer, typename LambdaIndexer>
 PORTABLE_INLINE_FUNCTION SolverStatus
 PTESolveDualKink(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_tot,
@@ -334,7 +339,7 @@ PTESolveDualKink(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_tot,
   }
   const Real t_hi = params.temperature_limit;
   if (!(p_hi > 0.0) || !(t_hi > t_lo)) return status;
-  const Real p_lo_bracket = std::max(p_lo, 1.0);
+  const Real p_lo_bracket = PressureBracketFloor(p_lo, params);
   const Real t_lo_bracket = std::max(t_lo, 1.0e-8);
   const Real p_lo_clamp = std::max(p_lo, 1.0e-300);
   const Real t_lo_clamp = t_lo_bracket;
@@ -680,7 +685,10 @@ PTESolveDualKink(const std::size_t nmat, EOSIndexer &&eos, const Real vfrac_tot,
     }
   }
   if (!done) {
-    if (certified_decline) return status;
+    if (certified_decline) {
+      status.admissibility = kAdmissibilityUnreachable;
+      return status;
+    }
     // Nothing has been written back, so the dual starts from exactly the caller's inputs.
     SolverStatus fallback = PTESolveDual(nmat, eos, vfrac_tot, sie_tot, rho, vfrac, sie, temp,
                                          press, lambda, Tguess, params);
