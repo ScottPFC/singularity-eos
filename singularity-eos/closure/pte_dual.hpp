@@ -27,8 +27,10 @@
 //      free-energy fit already enforces.  A sum of negative-definite matrices is negative
 //      definite, so the mixture Hessian is nonsingular for any nmat and any mass fractions.
 //
-// Symmetry is what makes the Newton direction d = -H^-1 R a descent direction on ||R||^2:
-// grad(merit).d = -R^T W^2 R < 0 needs H^T H^-1 = I, i.e. H symmetric.
+// An exact Newton step d = -H^-1 R descends ||R||^2 for any nonsingular H.  What symmetry and
+// negative definiteness add is that the step ASCENDS the one concave J (grad J.d = -R^T H^-1 R
+// > 0), so Newton and the safeguard's coordinate steps below improve the same objective, and
+// the recession and admissibility certificates follow from that objective.
 //
 // THE SAFEGUARD IS COORDINATE ASCENT ON THE SAME J, in (P, T).  The fixed-T pressure solve holds
 // beta and roots dJ/dgamma = r_tau, monotone because K_T > 0.  The fixed-P temperature solve moves
@@ -64,8 +66,9 @@
 //
 // ⚠️ IT NEEDS CONSISTENT DERIVATIVES, AND THAT IS THE WHOLE GATE.  The Hessian is assembled from
 // DensityEnergyDerivativesFromPressureTemperature.  Reconstructing those partials by differencing
-// rho and e instead violates the Maxwell relation by a few percent, and symmetrising a
-// 3%-asymmetric Jacobian destroys the descent guarantee: the same offline harness scored 59%
+// rho and e instead violates the Maxwell relation by a few percent.  A symmetrised Hessian 3%
+// away from the true Jacobian no longer gives a Newton step for R, so neither the contraction
+// nor the ascent on J is guaranteed: the same offline harness scored 59%
 // against 98% purely on that difference.  TableDependsPT and TableDependsRhoT both return the
 // stored fields, every one descended from the single fitted free energy, so this holds on the
 // shipped tables -- but a backend that derives them some other way must be checked.  `status`
