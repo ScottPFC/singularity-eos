@@ -5,6 +5,7 @@
 ### Added (new features/APIs/variables/...)
 - [[PR600]](https://github.com/lanl/singularity-eos/pull/600) Added mass fractions for multiphase tables to sesame2spiner and added MassFractionsFromDensityTemperture/InternalEnergy to the SpinerDependsRhoSIE and SpinerDependsRhoT equations of state.
 - [[PR589]](https://github.com/lanl/singularity-eos/pull/589) InternalEnergyFromDensityPressure
+- Vinet: optional solid-pool extension (constructor with k_min, t_floor): K_T-floored tension continuation below the spinodal and cold-floor entropy continuation; Python `Vinet(..., k_min, t_floor)`.
 
 ### Fixed (Repair bugs, etc)
 - [[PR609]](https://github.com/lanl/singularity-eos/pull/609) Fix bugs introduced in 607, which did not properly handle initial guesses and had a typo that introduced UB

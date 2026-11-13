@@ -23,6 +23,7 @@ add_executable(
   test_eos_stiff.cpp
   test_eos_carnahan_starling.cpp
   test_eos_vinet.cpp
+  test_eos_vinet_extended.cpp
   test_eos_mgusup.cpp
   test_eos_powermg.cpp
   test_eos_pt_partials.cpp
@@ -205,6 +206,12 @@ if(SINGULARITY_BUILD_PYTHON AND SINGULARITY_TEST_PYTHON)
     REQUIRED)
   set(PYTHON_TEST_ENVIRONMENT
       PYTHONPATH=${CMAKE_BINARY_DIR}/python:$ENV{PYTHONPATH})
+
+  add_test(NAME PythonVinetExtended
+           COMMAND ${Python_EXECUTABLE}
+                   ${CMAKE_CURRENT_SOURCE_DIR}/python_vinet_extended.py -v)
+  set_tests_properties(PythonVinetExtended PROPERTIES ENVIRONMENT
+                                                      "${PYTHON_TEST_ENVIRONMENT}")
 
   add_test(NAME PythonBindings
            COMMAND ${Python_EXECUTABLE}

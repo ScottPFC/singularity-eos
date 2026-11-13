@@ -144,7 +144,28 @@ PYBIND11_MODULE(singularity_eos, m) {
       }),
       py::arg("rho0"), py::arg("T0"), py::arg("B0"), py::arg("BP0"), py::arg("A0"),
       py::arg("Cv0"), py::arg("E0"), py::arg("S0"), py::arg("expconsts")
-    );
+    )
+    // Solid-pool extension: tension continuation below the spinodal (K_T held at k_min)
+    // and cold-floor entropy continuation below t_floor. 0 disables the respective part.
+    .def(
+      py::init([](Real rho0, Real T0, Real B0, Real BP0, Real A0, Real Cv0, Real E0,
+                  Real S0, py::array_t<Real, py::array::c_style | py::array::forcecast> expconsts,
+                  Real k_min, Real t_floor) {
+        if (expconsts.size() < 39)
+          throw std::invalid_argument("Vinet: expconsts needs the 39 coefficients d2..d40");
+        if (k_min < 0.0 || t_floor < 0.0)
+          throw std::invalid_argument("Vinet: k_min and t_floor must be >= 0");
+        if (k_min >= B0)
+          throw std::invalid_argument("Vinet: k_min must be below B0");
+        return Vinet(rho0, T0, B0, BP0, A0, Cv0, E0, S0, expconsts.data(), k_min, t_floor);
+      }),
+      py::arg("rho0"), py::arg("T0"), py::arg("B0"), py::arg("BP0"), py::arg("A0"),
+      py::arg("Cv0"), py::arg("E0"), py::arg("S0"), py::arg("expconsts"),
+      py::arg("k_min"), py::arg("t_floor")
+    )
+    .def_property_readonly("k_min", &Vinet::KMin)
+    .def_property_readonly("t_floor", &Vinet::TFloor)
+    .def_property_readonly("rho_lim", &Vinet::RhoLim);
 
   create_shifted_eos_classes(m);
   create_scaled_eos_classes(m);
