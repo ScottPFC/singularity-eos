@@ -211,6 +211,14 @@ if(SINGULARITY_BUILD_PYTHON AND SINGULARITY_TEST_PYTHON)
                    ${CMAKE_CURRENT_SOURCE_DIR}/python_bindings.py -v)
   set_tests_properties(PythonBindings PROPERTIES ENVIRONMENT
                                                  "${PYTHON_TEST_ENVIRONMENT}")
+
+  if(SINGULARITY_BUILD_CLOSURE)
+    add_test(NAME PythonPTE
+             COMMAND ${Python_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/python_pte.py -v)
+    set_tests_properties(PythonPTE PROPERTIES ENVIRONMENT
+                                              "${PYTHON_TEST_ENVIRONMENT}")
+  endif()
 endif()
 
 if(SINGULARITY_USE_SPINER)

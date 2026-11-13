@@ -20,6 +20,7 @@ pybind11_add_module(singularity_eos
   modifier_shifted.cpp
   modifier_scaled.cpp
   modifier_bilinear_ramp.cpp
+  pte.cpp
 )
 target_link_libraries(singularity_eos PRIVATE singularity-eos_Interface)
 

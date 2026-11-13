@@ -133,6 +133,19 @@ PYBIND11_MODULE(singularity_eos, m) {
     .def(py::init<int, bool>(), py::arg("matid"), py::arg("invert_at_setup")=false);
 #endif
 
+  eos_class<Vinet>(m, "Vinet")
+    .def(py::init())
+    .def(
+      py::init([](Real rho0, Real T0, Real B0, Real BP0, Real A0, Real Cv0, Real E0,
+                  Real S0, py::array_t<Real, py::array::c_style | py::array::forcecast> expconsts) {
+        if (expconsts.size() < 39)
+          throw std::invalid_argument("Vinet: expconsts needs the 39 coefficients d2..d40");
+        return Vinet(rho0, T0, B0, BP0, A0, Cv0, E0, S0, expconsts.data());
+      }),
+      py::arg("rho0"), py::arg("T0"), py::arg("B0"), py::arg("BP0"), py::arg("A0"),
+      py::arg("Cv0"), py::arg("E0"), py::arg("S0"), py::arg("expconsts")
+    );
+
   create_shifted_eos_classes(m);
   create_scaled_eos_classes(m);
   create_bilinear_ramp_eos_classes(m);
@@ -159,6 +172,8 @@ PYBIND11_MODULE(singularity_eos, m) {
   py::class_<eos_units_init::LengthTimeUnitsInit>(eos_units, "_LengthTimeUnits");
   eos_units.attr("ThermalUnits") = eos_units_init::thermal_units_init_tag;
   eos_units.attr("LengthTimeUnits") = eos_units_init::length_time_units_init_tag;
+
+  create_pte_bindings(m);
 
   m.doc() = "Singularity EOS Python Bindings";
 }
