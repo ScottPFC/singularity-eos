@@ -47,7 +47,19 @@ PYBIND11_MODULE(singularity_eos, m) {
       py::init<Real, Real, Real, Real, Real, Real, Real, Real, Real, Real>(),
       py::arg("C0"), py::arg("s1"), py::arg("s2"), py::arg("s3"), py::arg("G0"),
       py::arg("b"), py::arg("rho0"), py::arg("T0"), py::arg("P0"), py::arg("Cv")
-    );
+    )
+    // Solid-pool: bounded tension parameter (k_min < 0: default 0.02 K0; rho_max <= 0:
+    // computed)
+    .def(
+      py::init<Real, Real, Real, Real, Real, Real, Real, Real, Real, Real, Real, Real>(),
+      py::arg("C0"), py::arg("s1"), py::arg("s2"), py::arg("s3"), py::arg("G0"),
+      py::arg("b"), py::arg("rho0"), py::arg("T0"), py::arg("P0"), py::arg("Cv"),
+      py::arg("rho_max"), py::arg("k_min")
+    )
+    .def_property_readonly("k_min", &Gruneisen::KMin)
+    .def_property_readonly("rho_lim", &Gruneisen::RhoLim)
+    .def_property_readonly("K0", &Gruneisen::ColdBulkModulusAtRho0)
+    .def_property_readonly("tension_limit", &Gruneisen::TensionLimit);
 
   eos_class<JWL>(m, "JWL")
     .def(py::init())

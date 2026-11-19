@@ -865,9 +865,6 @@ the atomic mass and number as a final optional parameter, e.g.,
 Gruneisen EOS
 `````````````
 
-.. warning::
-    Entropy is not available for this EOS
-
 One of the most commonly-used EOS to represent solids is the Steinberg variation
 of the Mie-Gruneisen EOS, often just shortened to "Gruneisen" EOS. This EOS
 uses the Hugoniot as the reference curve and thus is extremely powerful because
@@ -884,24 +881,35 @@ Hugoniot. Other quantities are defined in the :ref:`nomenclature <Available EOS
 Information and Nomenclature>` section.
 
 The above is an incomplete equation of state because it only relates the
-pressure to the density and energy, the minimum required in a solution to the
-Euler equations. To complete the EOS and determine the temperature, a constant
-heat capacity is assumed so that
+pressure to the density and energy. This fork (solid-pool, D-A1-17) completes it
+consistently as a Mie-Gruneisen solid with a constant heat capacity,
 
 .. math::
 
-    T(\rho, e) = \frac{e}{C_V} + T_0
+    P(\rho, e) = p_c(\rho) + \rho\Gamma(\rho)\left(e - e_c(\rho)\right), \qquad
+    e(\rho, T) = e_c(\rho) + C_V T,
 
-The user should note that this implies that :math:`e=0` at the reference
-temperature, :math:`T_0`. Given this simple relationship, the user should
-treat the temperature from this EOS as only a rough estimate.
+where :math:`e_c` is the 0 K isentrope of the model's own :math:`P(\rho, e)`,
+:math:`de_c/d\rho = p_c/\rho^2`, through :math:`e_c(\rho_0) = -C_V T_0` (so
+:math:`e = 0` is still :math:`T = T_0` at :math:`\rho_0`). In compression
+:math:`p_c = P_H + \rho\Gamma(e_c - e_H)`, so :math:`P(\rho, e)` there is the
+Steinberg form above, unchanged; :math:`e_c` is integrated once at construction
+(Gauss-Legendre panels clustered toward the Hugoniot pole). The entropy is
+:math:`S = C_V \ln(T/T_0) - C_V\ln\theta(\rho)`, :math:`d\ln\theta/d\rho = \Gamma/\rho`,
+and every Maxwell relation holds to round-off. (Upstream used
+:math:`T = T_0 + e/C_V`, which is not consistent with :math:`P(\rho, e)`.)
 
-Given the inconsistency in the temperature, we have made the choice **not** to
-expose the entropy for this EOS. **Requesting an entropy value will result in an
-error.**
-
-If a linear :math:`U_s`-:math:`u_p` relation is enough for your problem, we recommend using the MGUsup
-EOS described below. It is a complete EOS with consistent temperature.
+In expansion the linear branch below has no spinodal (its 0 K isentrope tends to
+about :math:`-\rho_0 c_0^2/(1+\Gamma_0)`). The 0 K curve there is instead a Vinet
+curve anchored at :math:`\rho_0`, :math:`p_c = p_c(\rho_0) + 3K_0(1-x)x^{-2}e^{\eta_v(1-x)}`,
+:math:`x = (\rho_0/\rho)^{1/3}`, with :math:`K_0` the compression-side 0 K bulk modulus
+(:math:`p_c` is :math:`C^1` at :math:`\rho_0`) and :math:`K_0' = 4 s_1 - 1`. Below
+:math:`\rho_\mathrm{lim}`, where :math:`\rho\,dp_c/d\rho` falls to ``k_min``
+(default :math:`0.02 K_0`), it continues with :math:`\rho\,dp_c/d\rho = k_\mathrm{min}\rho/\rho_\mathrm{lim}`,
+so the tension is bounded below by :math:`p_\mathrm{lim} - k_\mathrm{min}`
+(``MinimumPressure()``). :math:`\Gamma = \Gamma_0` in expansion, so the thermal
+pressure vanishes as :math:`\rho \to 0`. ``Gruneisen(..., Cv, rho_max, k_min)``
+sets ``k_min`` (``rho_max <= 0`` computes it; ``k_min < 0`` takes the default).
 
 Given a reference density, :math:`\rho_0`, we first parameterize the EOS using
 :math:`\eta` as a measure of compression given by
@@ -970,8 +978,8 @@ Finally the energy along the Hugoniot is given by
         \frac{\eta (P_H + P_0)}{2 \rho_0}               & \rho \geq \rho_0
       \end{cases}.
 
-One should note that in this form neither the expansion region nor the overall
-temperature are thermodynamically consistent with the rest of the EOS. Since the
+The expansion branch of :math:`P_H` and :math:`E_H` above is the upstream one; this fork
+replaces it by the bounded cold curve described earlier. Since the
 EOS is a fit to the principal Hugoniot, the EOS will obviously reproduce single
 shocks quite well, but it may not be as appropriate when there are multiple
 shocks or for modeling the release behavior of a material.

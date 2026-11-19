@@ -5,6 +5,7 @@
 ### Added (new features/APIs/variables/...)
 - [[PR600]](https://github.com/lanl/singularity-eos/pull/600) Added mass fractions for multiphase tables to sesame2spiner and added MassFractionsFromDensityTemperture/InternalEnergy to the SpinerDependsRhoSIE and SpinerDependsRhoT equations of state.
 - [[PR589]](https://github.com/lanl/singularity-eos/pull/589) InternalEnergyFromDensityPressure
+- Gruneisen (solid-pool, D-A1-17): thermodynamically consistent completion e = e_c(rho) + Cv T with e_c the 0 K isentrope of P(rho, e) (compression P(rho, e) unchanged), a bounded tensile branch (Vinet-shaped cold curve to rho_lim, then rho dp_c/drho = k_min rho/rho_lim), entropy, closed-form e(rho, P), exact (P,T) partials; constructor `Gruneisen(..., Cv, rho_max, k_min)`. MaximumPressureAtTemperature returns a pressure (it returned a density).
 - Vinet: optional solid-pool extension (constructor with k_min, t_floor): K_T-floored tension continuation below the spinodal and cold-floor entropy continuation; Python `Vinet(..., k_min, t_floor)`.
 
 ### Fixed (Repair bugs, etc)

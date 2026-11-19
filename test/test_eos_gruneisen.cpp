@@ -35,34 +35,8 @@ PORTABLE_INLINE_FUNCTION Real QuadFormulaMinus(Real a, Real b, Real c) {
 
 constexpr Real REAL_TOL = std::numeric_limits<Real>::epsilon() * 1e4; // 1e-12 for double
 
-// Only run exception checking when we aren't offloading to the GPUs
-#ifdef PORTABILITY_STRATEGY_NONE
-SCENARIO("Gruneisen EOS entropy is disabled", "[GruneisenEOS][Entropy]") {
-  GIVEN("Parameters for a Gruneisen EOS") {
-    // Unit conversions
-    constexpr Real cm = 1.;
-    constexpr Real us = 1e-06;
-    constexpr Real Mbcc_per_g = 1e12;
-    // Gruneisen parameters for copper
-    constexpr Real C0 = 0.394 * cm / us;
-    constexpr Real S1 = 1.489;
-    constexpr Real S2 = 0.;
-    constexpr Real S3 = 0.;
-    constexpr Real Gamma0 = 2.02;
-    constexpr Real b = 0.47;
-    constexpr Real rho0 = 8.93;
-    constexpr Real T0 = 298.;
-    constexpr Real P0 = 0.;
-    constexpr Real Cv = 0.383e-05 * Mbcc_per_g;
-    // Create the EOS
-    EOS host_eos = Gruneisen(C0, S1, S2, S3, Gamma0, b, rho0, T0, P0, Cv);
-    EOS eos = host_eos.GetOnDevice();
-    THEN("A call to the entropy should throw an exception") {
-      REQUIRE_THROWS(eos.EntropyFromDensityTemperature(1.0, 1.0));
-    }
-  }
-}
-#endif
+// Entropy is enabled by the consistent completion (D-A1-17); it is tested in
+// test_eos_gruneisen_consistent.cpp.
 
 SCENARIO("Gruneisen EOS", "[VectorEOS][GruneisenEOS]") {
   GIVEN("Parameters for a Gruneisen EOS") {
@@ -105,7 +79,7 @@ SCENARIO("Gruneisen EOS", "[VectorEOS][GruneisenEOS]") {
             v_density[0] = 8.0;
             v_density[1] = 9.0;
             v_density[2] = 9.5;
-            v_density[3] = 0.;
+            v_density[3] = 1.e-3; // bounded tension tail
             v_energy[0] = 1.e9;
             v_energy[1] = 5.e8;
             v_energy[2] = 1.e8;
@@ -120,15 +94,19 @@ SCENARIO("Gruneisen EOS", "[VectorEOS][GruneisenEOS]") {
       Kokkos::deep_copy(energy, v_energy);
 #endif // PORTABILITY_STRATEGY_KOKKOS
 
-      // Gold standard values for a subset of lookups
+      // Gold standard values for a subset of lookups. P(rho, e) and B_S for rho >= rho0
+      // are the upstream values (the compression P(rho, e) is unchanged); the expansion
+      // values and every T come from test/gruneisen_consistent_oracle.py (consistent model,
+      // e = e_c(rho) + Cv T, D-A1-17).
       constexpr std::array<Real, num> pressure_true{
-          -1.282094800000000e+11, 1.998504088912181e+10, 9.595823319513451e+10,
-          P0 - C0 * C0 * rho0};
+          -1.15213965726963516e+11, 1.998504088912181e+10, 9.595823319513451e+10,
+          -7.13722595471220093e+11};
       constexpr std::array<Real, num> bulkmodulus_true{
-          9.990648504000005e+11, 1.460692677162573e+12, 1.851227213843747e+12,
-          Gamma0 * (P0 - C0 * C0 * rho0)};
+          7.82873999062868774e+11, 1.460692677162573e+12, 1.851227213843747e+12,
+          -1.44158554517680054e+12};
       constexpr std::array<Real, num> temperature_true{
-          5.590966057441253e+02, 4.285483028720627e+02, 3.241096605744125e+02, T0};
+          2.76799609982125276e+02, 4.32026414572880867e+02, 2.80352397208598518e+02,
+          -6.16999219838049561e+07};
       constexpr std::array<Real, num> gruneisen_true{Gamma0, 2.007944444444444e+00,
                                                      1.927000000000000e+00, Gamma0};
 
